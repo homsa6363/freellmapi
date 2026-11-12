@@ -1,0 +1,493 @@
+#!/usr/bin/env node
+/**
+ * Turn demo.json into Remotion props.
+ *
+ *   node scripts/render/build-props.mjs --project demo/<slug>
+ *
+ * This is the seam between the pipeline and the compositor, and it does three
+ * things the renderer should not have to:
+ *
+ *  1. VALIDATES that every artifact a scene claims actually exists on disk. A
+ *     missing clip surfaces here as a clear error instead of a black rectangle in
+ *     the finished render.
+ *  2. INLINES the per-scene data the components need — the capture event log (for
+ *     zoom-to-click) and the word timings (for captions) — so components never do
+ *     file I/O.
+ *  3. RECONCILES claimed durations with measured ones. Generated video comes back
+ *     at whatever length the model felt like; if a presenter clip is 7.4s but the
+ *     manifest says 8.0s, the scene is trimmed to what actually exists rather than
+ *     holding on a frozen last frame.
+ */
+import path from "node:path";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { parseArgs } from "../lib/args.mjs";
+import * as manifest from "../lib/manifest.mjs";
+import { probe } from "../lib/ff.mjs";
+import { minSceneDuration, gapAfter, transitionAfterSec } from "../lib/pacing.mjs";
+import { buildSfxTrack } from "../lib/sfx.mjs";
+import { STYLES } from "../lib/styles.mjs";
+import { buildLayoutTrack, layoutBefore } from "../lib/layouts.mjs";
+import { report, info, warn, main, fmtDuration } from "../lib/log.mjs";
+
+const USAGE = "build-props.mjs --project <dir> [--manifest <file>] [--out <props.json>] [--lenient]";
+
+async function readJson(file) {
+  try {
+    return JSON.parse(await readFile(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export async function buildProps(projectDir, { lenient = false, name = manifest.MANIFEST_NAME } = {}) {
+  const m = await manifest.load(projectDir, { name });
+  const manifestRef = m;
+
+  const check = manifest.validate(m);
+  for (const w of check.warnings) warn(w);
+  if (!check.ok) {
+    throw new Error(`${name} is not renderable:\n  - ${check.errors.join("\n  - ")}`);
+  }
+
+  const problems = [];
+  const timeline = [];
+
+  for (const [sceneIndex, scene] of m.timeline.entries()) {
+    const out = { ...scene };
+    // The last scene has no following line to collide with, so it only needs to
+    // outlast its own narration — it does not need the extra breath.
+    const isLast = sceneIndex === m.timeline.length - 1;
+
+    if (scene.video) {
+      const abs = manifest.resolveIn(projectDir, scene.video);
+      if (!existsSync(abs)) {
+        problems.push(`scene "${scene.id}": video not found at ${scene.video}`);
+      } else {
+        const meta = await probe(abs).catch(() => null);
+        if (meta?.duration) {
+          // A scene windowing into a longer take (scene-level videoStartSec, the
+          // continuous-capture tutorial pattern) only has the clip's tail to play;
+          // beats ignore the scene-level value and window per beat instead.
+          const startSec = scene.beats?.length ? 0 : scene.videoStartSec || 0;
+          const avail = meta.duration - startSec;
+          const claimed = scene.durationSec || avail;
+          const clipDesc = startSec
+            ? `clip has ${fmtDuration(avail)} left after videoStartSec ${startSec}s`
+            : `clip is ${fmtDuration(meta.duration)}`;
+          // Never ask the renderer for more video than exists — BUT never trim a
+          // scene so short that it cuts its own narration off mid-word, or that the
+          // next line starts before this one ends. A clip that is fractionally
+          // short is a much smaller problem than audio talking over itself.
+          const floor = isLast
+            ? (scene.narrationSec || 0)
+            : minSceneDuration(manifestRef, scene);
+          if (avail < claimed - 0.1) {
+            if (avail >= floor) {
+              warn(
+                `scene "${scene.id}": ${clipDesc} but the timeline ` +
+                `wants ${fmtDuration(claimed)} — trimming the scene to the clip.`
+              );
+              out.durationSec = avail;
+            } else {
+              warn(
+                `scene "${scene.id}": ${clipDesc}, shorter than the ` +
+                `${fmtDuration(floor)} its narration needs — holding the last frame instead of ` +
+                `cutting the voice off. Re-record it with --target-duration ${floor.toFixed(2)}.`
+              );
+            }
+          }
+        }
+      }
+    } else if (scene.kind === "presenter" && m.presenter?.mode === "always" && m.presenter?.continuousPip) {
+      // Under a continuous take the presenter scene IS the take, full frame
+      // (dynamic `face`); it needs no clip of its own — the take layer covers it.
+    } else if (scene.kind !== "card") {
+      problems.push(`scene "${scene.id}": kind "${scene.kind}" has no video`);
+    }
+
+    if (scene.audio) {
+      const abs = manifest.resolveIn(projectDir, scene.audio);
+      if (!existsSync(abs)) problems.push(`scene "${scene.id}": audio not found at ${scene.audio}`);
+    }
+
+    // Split bottom-zone artifacts. A missing presenter clip is only fatal when
+    // the presenter is enabled (otherwise the renderer degrades to captions).
+    if (scene.bottom?.kind === "presenter" && m.presenter?.mode !== "none") {
+      const abs = scene.presenterVideo ? manifest.resolveIn(projectDir, scene.presenterVideo) : null;
+      if (!abs || !existsSync(abs)) {
+        problems.push(`scene "${scene.id}": bottom presenter clip missing — run gen/presenter.mjs --all`);
+      }
+    }
+    if (scene.bottom?.kind === "image") {
+      const abs = manifest.resolveIn(projectDir, scene.bottom.image);
+      if (!abs || !existsSync(abs)) {
+        problems.push(`scene "${scene.id}": bottom image not found at ${scene.bottom?.image}`);
+      }
+    }
+
+    // Beat-level artifacts: insert images must exist; face beats need the
+    // presenter clip; a videoStartSec jump must not outrun the capture.
+    for (const [bi, b] of (scene.beats || []).entries()) {
+      if (b.shot === "insert" && b.image) {
+        const abs = manifest.resolveIn(projectDir, b.image);
+        if (!existsSync(abs)) problems.push(`scene "${scene.id}" beats[${bi}]: insert image not found at ${b.image}`);
+      }
+      for (const img of b.shot === "insert" ? b.images || [] : []) {
+        const abs = manifest.resolveIn(projectDir, img);
+        if (!existsSync(abs)) problems.push(`scene "${scene.id}" beats[${bi}]: insert image not found at ${img}`);
+      }
+      if (b.shot === "insert" && !b.image && !b.images?.length && b.prompt) {
+        problems.push(`scene "${scene.id}" beats[${bi}]: insert has a prompt but no generated image yet`);
+      }
+    }
+    // An anchored scene's bottom presenter runs the whole scene from 0 — a clip
+    // meaningfully shorter than the scene freezes at the tail.
+    if (scene.beatLayout === "anchored" && scene.bottom?.kind === "presenter" &&
+        m.presenter?.mode !== "none" && scene.presenterVideo) {
+      const abs = manifest.resolveIn(projectDir, scene.presenterVideo);
+      const pMeta = existsSync(abs) ? await probe(abs).catch(() => null) : null;
+      if (pMeta?.duration && scene.durationSec && pMeta.duration < scene.durationSec - 0.25) {
+        warn(
+          `scene "${scene.id}": anchored bottom presenter clip is ${pMeta.duration.toFixed(1)}s for a ` +
+          `${scene.durationSec.toFixed(1)}s scene — the speaker will freeze for the last ` +
+          `${(scene.durationSec - pMeta.duration).toFixed(1)}s.`
+        );
+      }
+    }
+    // Corner pip (mode "always" over a plain demo scene): a missing clip is only
+    // a warning — the bubble is silently absent, never a black frame — so a
+    // pre-pip "always" project stays renderable exactly as before. A clip
+    // meaningfully shorter than the scene freezes at the tail (the avatar engine
+    // quantises to 5s/10s): the fix is editorial — split the step or shorten the
+    // narration — so say that.
+    // A continuous take (presenter.pipTake, from presenter.mjs --take) replaces
+    // the per-scene clips entirely, so their checks do not apply.
+    const hasTake = !!m.presenter?.pipTake?.segments?.length;
+    if (m.presenter?.mode === "always" && !hasTake && scene.kind === "demo" &&
+        !scene.beats?.length && !scene.bottom && scene.framing !== "split" && scene.pip !== false) {
+      const abs = scene.presenterVideo ? manifest.resolveIn(projectDir, scene.presenterVideo) : null;
+      if (!abs || !existsSync(abs)) {
+        warn(`scene "${scene.id}": corner pip clip missing — the bubble will not appear; run gen/presenter.mjs --all`);
+      } else {
+        const pMeta = await probe(abs).catch(() => null);
+        if (pMeta?.duration && scene.durationSec && pMeta.duration < scene.durationSec - 0.25) {
+          warn(
+            `scene "${scene.id}": corner pip clip is ${pMeta.duration.toFixed(1)}s for a ` +
+            `${scene.durationSec.toFixed(1)}s scene — the speaker will freeze for the last ` +
+            `${(scene.durationSec - pMeta.duration).toFixed(1)}s; split the step or shorten the narration.`
+          );
+        }
+      }
+    }
+    if ((scene.beats || []).some((b) => b.shot === "face") && m.presenter?.mode !== "none") {
+      const abs = scene.presenterVideo ? manifest.resolveIn(projectDir, scene.presenterVideo) : null;
+      if (!abs || !existsSync(abs)) {
+        problems.push(`scene "${scene.id}": has face beats but no presenter clip — run gen/presenter.mjs --all`);
+      } else if (scene.beats?.length) {
+        const pMeta = await probe(abs).catch(() => null);
+        const lastPresenterBeat = [...scene.beats].reverse().find(
+          (b) => b.shot === "face" || (b.shot === "split" && scene.bottom?.kind === "presenter")
+        );
+        if (pMeta?.duration && lastPresenterBeat && pMeta.duration < (scene.durationSec || 0) - 0.25 &&
+            lastPresenterBeat.atSec > pMeta.duration - 0.5) {
+          warn(
+            `scene "${scene.id}": the last presenter beat starts at ${lastPresenterBeat.atSec}s but the ` +
+            `presenter clip is only ${pMeta.duration.toFixed(1)}s — the face will freeze.`
+          );
+        }
+      }
+    }
+    if (scene.beats?.length && scene.video) {
+      const abs = manifest.resolveIn(projectDir, scene.video);
+      const vMeta = existsSync(abs) ? await probe(abs).catch(() => null) : null;
+      if (vMeta?.duration) {
+        for (const [bi, b] of scene.beats.entries()) {
+          if (b.videoStartSec == null) continue;
+          const end = bi < scene.beats.length - 1 ? scene.beats[bi + 1].atSec : scene.durationSec || b.atSec;
+          const needed = b.videoStartSec + (end - b.atSec);
+          if (needed > vMeta.duration + 0.1) {
+            warn(
+              `scene "${scene.id}" beats[${bi}]: videoStartSec ${b.videoStartSec}s + window runs to ` +
+              `${needed.toFixed(1)}s but the clip is ${vMeta.duration.toFixed(1)}s — the frame will freeze.`
+            );
+          }
+        }
+      }
+    }
+
+    // Manifest-level zoomToClick (false for walkthrough styles) is the default
+    // for every demo scene that does not decide for itself.
+    if (scene.kind === "demo" && scene.zoomToClick == null && m.zoomToClick === false) out.zoomToClick = false;
+
+    // Dynamic style: beat scenes render through DynamicScene (content pane
+    // under a moving presenter frame) unless the scene chose another layout.
+    if (scene.kind === "demo" && scene.beats?.length && !scene.beatLayout &&
+        (STYLES[m.style]?.rules?.layouts || scene.beats.some((b) => b.layout))) {
+      out.beatLayout = "dynamic";
+    }
+
+    // Inline the event log so DemoClip can zoom toward clicks.
+    if (scene.events) {
+      const ev = await readJson(manifest.resolveIn(projectDir, scene.events));
+      if (ev) {
+        out.events = ev.events || [];
+        out.viewport = ev.viewport || scene.viewport;
+      } else {
+        warn(`scene "${scene.id}": could not read events — zoom-to-click disabled for it.`);
+      }
+    }
+
+    // Inline word timings for captions. A scene may opt out with `captions: false`
+    // (a narrated end card whose caption would sit on top of the logo, say).
+    if (scene.words && scene.captions !== false) {
+      const w = await readJson(manifest.resolveIn(projectDir, scene.words));
+      if (w?.timestamps?.length) out.wordTimings = w.timestamps;
+    }
+
+    if (!out.durationSec) {
+      problems.push(`scene "${scene.id}": no duration could be determined`);
+    }
+    timeline.push(out);
+  }
+
+  /**
+   * Last line of defence on the audio timeline.
+   *
+   * Transitions overlap scenes, so a scene that is not longer than its narration
+   * makes the next line start underneath the current one. This is inaudible in any
+   * still frame and only shows up when you listen, so it is checked mechanically
+   * here rather than left to review.
+   */
+  for (const [i, scene] of timeline.entries()) {
+    if (!scene.narrationSec || i === timeline.length - 1) continue;
+    const gap = gapAfter(m, { ...scene, durationSec: scene.durationSec });
+    if (gap != null && gap < 0) {
+      const needed = scene.narrationSec + transitionAfterSec(m, scene.id) + 0.15;
+      warn(
+        `scene "${scene.id}": narration overlaps the next line by ${Math.abs(gap).toFixed(2)}s — ` +
+        `extending the scene to ${needed.toFixed(2)}s so the voices do not collide.`
+      );
+      scene.durationSec = Number(needed.toFixed(3));
+    }
+  }
+
+  if (m.watermark?.image && !existsSync(manifest.resolveIn(projectDir, m.watermark.image))) {
+    problems.push(`watermark image not found at ${m.watermark.image}`);
+  }
+
+  /**
+   * Presenter layout track (dynamic style). Beats declare `layout` scene-
+   * relatively; the renderer's single presenter layer needs it on the absolute
+   * timeline, and each dynamic scene needs to know what it inherits, so both
+   * are resolved here — on the reconciled durations — and inlined.
+   */
+  let presenter = m.presenter;
+  const dynamicScenes = timeline.filter((s) => s.beatLayout === "dynamic");
+  const isDynamicStyle = !!STYLES[m.style]?.rules?.layouts;
+  if (dynamicScenes.length || isDynamicStyle) {
+    const track = buildLayoutTrack(timeline, m.transitions);
+    const starts = new Map();
+    let cursor = 0;
+    for (const [i, sc] of timeline.entries()) {
+      starts.set(sc.id, cursor);
+      cursor += sc.durationSec || 0;
+      if (i < timeline.length - 1) cursor -= transitionAfterSec(m, sc.id);
+    }
+    const runtime = cursor;
+    for (const sc of timeline) {
+      if (sc.beatLayout !== "dynamic") continue;
+      const prev = layoutBefore(track, starts.get(sc.id));
+      sc.prevLayout = prev;
+      let running = prev;
+      sc.beats = sc.beats.map((b) => {
+        if (b.layout) running = b.layout;
+        return { ...b, layout: running };
+      });
+    }
+    const segs = (m.presenter?.pipTake?.segments || []).map((s) => ({ ...s }));
+    // The frame letterboxes a take whose aspect differs from the frame's
+    // (rectFor in lib/layouts.js), so every segment needs its size; older
+    // takes were saved without one — probe them here.
+    for (const seg of segs) {
+      if (seg.width && seg.height) continue;
+      const abs = manifest.resolveIn(projectDir, seg.video);
+      const meta = existsSync(abs) ? await probe(abs).catch(() => null) : null;
+      if (meta?.width && meta?.height) { seg.width = meta.width; seg.height = meta.height; }
+    }
+    presenter = { ...m.presenter, layoutTrack: track, ...(segs.length ? { pipTake: { ...m.presenter.pipTake, segments: segs } } : {}) };
+    if (m.presenter?.mode === "always") {
+      if (!segs.length) {
+        const msg = `no continuous presenter take (presenter.pipTake) — the ${m.style || "dynamic"} style is the presenter re-framed over the screen; run gen/presenter.mjs --all`;
+        if (isDynamicStyle) problems.push(msg); else warn(msg);
+      } else {
+        for (const seg of segs) {
+          if (!existsSync(manifest.resolveIn(projectDir, seg.video))) problems.push(`presenter take not found at ${seg.video}`);
+        }
+        const covered = segs.reduce((s, x) => s + (x.durationSec || 0), 0);
+        if (covered + 0.25 < runtime) {
+          warn(`the presenter take covers ${fmtDuration(covered)} of a ${fmtDuration(runtime)} video — the frame will be empty past its end; re-run gen/presenter.mjs --all`);
+        }
+        // A chunk seam re-poses the avatar. A chunked take (presenter.mjs)
+        // cross-dissolves it over the previous chunk's silent tail; a tail-less
+        // seam (an older take, or --take-overlap 0) only hides inside a layout move.
+        for (const [i, seg] of segs.slice(1).entries()) {
+          if ((segs[i].overlapSec || 0) > 0) continue;
+          const onMove = track.some((e) => Math.abs(e.fromSec - seg.fromSec) < 0.06);
+          if (!onMove) {
+            warn(`presenter take segment starts at ${seg.fromSec.toFixed(2)}s with no layout change there — the avatar will visibly re-pose; start a beat with a different layout at that second`);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Is the presenter visible on the very first frame? Decides whether the
+   * hook band needs its own portrait (see the overlay branch below).
+   */
+  function presenterOnFrame0(m, timeline, presenter) {
+    const first = timeline[0];
+    if (!first) return false;
+    const mode = m.presenter?.mode;
+    if (mode === "always") {
+      const segs = presenter?.pipTake?.segments || [];
+      if (segs.length) {
+        if ((segs[0].fromSec || 0) > 0.05) return false;
+        const track = presenter?.layoutTrack;
+        if (track?.length) return track[0].fromSec <= 0.05 && track[0].layout !== "none";
+        return first.pip !== false;
+      }
+      // per-scene corner bubble
+      if (first.kind === "demo" && first.presenterVideo && first.pip !== false) return true;
+    }
+    if (first.kind === "presenter") return !!first.video || mode !== "none";
+    if (first.kind === "demo" && first.beats?.length) {
+      const b0 = first.beats[0];
+      if (b0.shot === "face") return true;
+      if (b0.shot === "split" || first.beatLayout === "anchored") {
+        return !!first.presenterVideo && first.bottom?.kind === "presenter";
+      }
+    }
+    return false;
+  }
+
+  // The frame-0 hook card. Defaults are resolved here, not in the component, so
+  // props.json shows exactly what will render; accent falls back to the brand.
+  let cover = null;
+  if (m.cover && (m.cover.kind || "card") === "frame") {
+    // Frozen-frame cover: resolve the timestamp to an absolute second on the
+    // same overlapping timeline the composition lays scenes out on.
+    let frameSec = m.cover.atSec;
+    const starts = new Map();
+    let cursor = 0;
+    for (const [i, sc] of timeline.entries()) {
+      starts.set(sc.id, cursor);
+      cursor += sc.durationSec || 0;
+      if (i < timeline.length - 1) cursor -= transitionAfterSec(m, sc.id);
+    }
+    const totalSec = cursor;
+    if (m.cover.scene) {
+      const sc = timeline.find((x) => x.id === m.cover.scene);
+      if (!sc) problems.push(`cover.scene "${m.cover.scene}" is not in the timeline`);
+      else {
+        if (m.cover.atSec > (sc.durationSec || 0)) {
+          warn(`cover.atSec ${m.cover.atSec}s is past the end of scene "${sc.id}" (${sc.durationSec}s) — clamping`);
+        }
+        frameSec = starts.get(sc.id) + Math.min(m.cover.atSec, Math.max(0, (sc.durationSec || 0) - 0.05));
+      }
+    }
+    if (typeof frameSec !== "number" || !(frameSec >= 0)) problems.push("cover.atSec is missing — the second of the video to freeze as frame 0");
+    else if (frameSec >= totalSec) problems.push(`cover.atSec resolves to ${frameSec.toFixed(2)}s but the video is ${totalSec.toFixed(2)}s long`);
+    const hold = m.cover.holdSec ?? manifest.COVER_FRAME_DEFAULTS.holdSec;
+    if (typeof frameSec === "number" && frameSec < hold) {
+      warn(`cover.atSec ${frameSec}s is inside the ${hold}s hold — the poster would be the same as the open; pick a later moment`);
+    }
+    cover = { ...manifest.COVER_FRAME_DEFAULTS, ...m.cover, kind: "frame", frameSec: Number((frameSec ?? 0).toFixed(3)) };
+  } else if (m.cover && m.cover.kind === "overlay") {
+    if (!m.cover.hook) problems.push("cover.hook is empty — write the hook line for the frame-0 band (or remove cover)");
+    if (m.cover.portrait && !existsSync(manifest.resolveIn(projectDir, m.cover.portrait))) {
+      problems.push(`cover portrait not found at ${m.cover.portrait}`);
+    }
+    // The band's little circle portrait exists so a poster frame has the
+    // presenter on it; when frame 0 already shows them (a face opening beat,
+    // an anchored split, a corner bubble) it just repeats the face — drop it.
+    if (m.cover.portrait && presenterOnFrame0(m, timeline, presenter)) {
+      info(`  cover: the presenter is already on frame 0 — leaving the band's portrait out`);
+      m.cover = { ...m.cover, portrait: null };
+    }
+    // The default band position is the vertical one (over the demo pane of a
+    // Short); on landscape the component places the band in the lower third,
+    // clear of the face, unless the manifest sets top/height itself.
+    const { top: _t, height: _h, exit: _e, ...overlayDefaults } = manifest.COVER_OVERLAY_DEFAULTS;
+    const landscape = (m.format?.width || 0) > (m.format?.height || 0);
+    cover = { ...(landscape ? overlayDefaults : manifest.COVER_OVERLAY_DEFAULTS), accent: m.brand?.colors?.primary || "#5B8DEF", ...m.cover, kind: "overlay" };
+  } else if (m.cover) {
+    if (!m.cover.hook) problems.push("cover.hook is empty — write the hook line for the frame-0 card (or remove cover)");
+    if (m.cover.portrait && !existsSync(manifest.resolveIn(projectDir, m.cover.portrait))) {
+      problems.push(`cover portrait not found at ${m.cover.portrait}`);
+    }
+    cover = { kind: "card", ...manifest.COVER_DEFAULTS, accent: m.brand?.colors?.primary || "#5B8DEF", ...m.cover };
+  }
+
+  // Sound effects, placed on the same absolute timeline the composition lays
+  // narration on (see lib/sfx.mjs). The renderer just plays the track.
+  let sfx = null;
+  let sfxTrack = [];
+  if (m.sfx && m.sfx.enabled !== false) {
+    const fps = m.format?.fps || 30;
+    const built = await buildSfxTrack(m, {
+      timeline, cover, fps, projectDir,
+      probeSec: async (abs) => (await probe(abs).catch(() => null))?.duration || null,
+    });
+    problems.push(...built.problems);
+    sfxTrack = built.track;
+    sfx = { gain: m.sfx.gain ?? 0.7, duckDb: m.sfx.duckDb ?? -6 };
+    if (sfxTrack.length) info(`  ${sfxTrack.length} sound-effect cue(s) on the timeline`);
+  }
+
+  if (problems.length) {
+    const msg = `Cannot render yet:\n  - ${problems.join("\n  - ")}`;
+    if (!lenient) throw new Error(msg);
+    warn(msg);
+  }
+
+  return {
+    slug: m.slug,
+    format: m.format,
+    brand: m.brand,
+    style: m.style || null,
+    presenter,
+    music: m.music,
+    captions: m.captions,
+    watermark: m.watermark,
+    cover,
+    sfx,
+    sfxTrack,
+    transitions: m.transitions || [],
+    timeline,
+  };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  await main(async () => {
+    const args = parseArgs(process.argv.slice(2));
+    const projectDir = manifest.resolveProjectDir(args.project);
+    const props = await buildProps(projectDir, {
+      lenient: Boolean(args.lenient),
+      name: args.manifest || manifest.MANIFEST_NAME,
+    });
+
+    const out = path.resolve(args.out || path.join(projectDir, "remotion", "src", "props.json"));
+    await mkdir(path.dirname(out), { recursive: true });
+    await writeFile(out, `${JSON.stringify(props, null, 2)}\n`);
+
+    const total = props.timeline.reduce((s, x) => s + (x.durationSec || 0), 0);
+    const overlap = (props.transitions || []).reduce((s, t) => s + (t.ms || 400) / 1000, 0);
+    info(`  ${props.timeline.length} scene(s), ${fmtDuration(total - overlap)} finished runtime`);
+    report(`  props -> ${out}`, {
+      ok: true, props: out, scenes: props.timeline.length,
+      runtimeSec: total - overlap,
+    });
+  });
+}

@@ -1,0 +1,115 @@
+# Audio: voice-over, music, SFX, captions (gates 0 and 7)
+
+Everything here runs locally: TTS on the user's own server, music and SFX synthesised on this machine, no samples, no network at render. Never call TTS without consent (`studio.json → services.tts` or `--allow-tts` after asking).
+
+## Who owns the sound
+| Part | Tool | Delivered? |
+|---|---|---|
+| Final mix (VO + music + SFX, ducking, −14 LUFS, captions) | FFmpeg in `concat-and-mix.mjs` | yes — the only source of sound in the MP4 |
+| Listening page `review/audio-picker.html` | howler.js (vendored `assets/vendor/howler.core.min.js`, MIT) | no — auditioning only |
+| SFX preview in HyperFrames studio | howler.js via `os.js` + `assets/audio-cues.js` | no — skipped whenever `navigator.webdriver` is true (every render/snapshot) |
+
+Headless renders never capture browser audio, and every clip is normalised with `-an`, so anything played in a scene is lost. The mix stays deterministic because only FFmpeg builds it from files and storyboard timings. `audio-cues.js`, `assets/sfx/` and `assets/music/` are left out of every scene hash: changing a sound never re-renders a picture.
+
+## Voice (gate 0, confirm before the first call)
+- `POST {base_url}/v1/audio/speech` with `{model, input, voice, response_format: "wav", speed}`; any audio format comes back as 48 kHz mono WAV.
+- `studio.json → audio.tts`: `vi` → ZeroTTS, `en` → Chatterbox (port 8002, see below), `default` → OmniVoice. Per-line override: `lines[].lang`, `lines[].voice`. Brand voice preset (`brand.json → voice.<lang>`) wins over the endpoint voice, so a series keeps one voice.
+- `init-project.mjs` writes the placeholder voice `default`, which real servers reject. Pick a real one:
+  1. `init-project.mjs D --tts-url http://localhost:8000 --probe-tts` or `tts-openai-compatible.mjs --voices D` → voice ids (ZeroTTS: `GET /v1/audio/voices`; also tries `/v1/voices`, `/voices`). Listing is not synthesis: no consent needed.
+  2. Ask: "Nghe thử N giọng (N lần gọi ZeroTTS) nhé?" → `tts-openai-compatible.mjs D --samples all --text "<one line of the script>" --allow-tts` → `review/voices/<id>.wav`.
+  3. `audio-picker.mjs D` → show `review/audio-picker.html`; the user picks by ear → `tts-openai-compatible.mjs D --use-voice <id>` (also updates a brand voice preset; for a series say that later episodes use it too).
+- A rejected voice fails with the server's real list in the message.
+- Keys only from env: `ONE_STUDIO_TTS_KEY_VI`, `ONE_STUDIO_TTS_KEY` (names in `key_env`). Never write a key into a file.
+- Health check: `tts-openai-compatible.mjs --probe D` (one call: models, codec, sample rate, latency).
+
+## Chatterbox (English, bundled server)
+Local, MIT, most natural open English voice we ship; slower than real time is fine for video.
+- Start: `bash "$S/servers/chatterbox/chatterbox-server.sh"` (first run installs Python 3.11 + torch into `~/.one-studio/chatterbox/.venv` via `uv`, then downloads the model, ~3 GB). Uses CUDA when present, else CPU (on Apple Silicon the CPU is ~9x faster than MPS: about 2 s of compute per 1 s of speech). Keep it in its own terminal.
+- Voices: `default` is built in and works as is. Clone a voice: put 5–15 s of clean speech at `~/.one-studio/chatterbox/voices/<name>.wav`; it shows up as voice `<name>` (no restart). Only clone voices the user owns or has permission to use.
+- Tuning (env, restart to apply): `CHATTERBOX_EXAGGERATION` (emotion, 0.5 default; 0.7+ more dramatic), `CHATTERBOX_CFG` (0.5; lower = slower, more deliberate). `speed` is applied with ffmpeg `atempo`.
+- Optional key: set `CHATTERBOX_API_KEY` on the server and `ONE_STUDIO_TTS_KEY_EN` for the scripts.
+
+## Captions (gate 0 question, re-ask at gate 7)
+Ask once at gate 0, with the user's language:
+> "Video có phụ đề không? **không** · **chỉ file .srt** · **phụ đề mềm** (bật/tắt được trong trình phát, kèm .srt) · **in cứng vào hình**"
+
+| Answer | mode | Output |
+|---|---|---|
+| không / none | `none` | no `captions.srt`, nothing muxed, no `.srt` next to the video |
+| chỉ file .srt / sidecar | `sidecar` | `out/<name>.srt` only |
+| phụ đề mềm / soft | `mux` | `mov_text` track + `.srt` (stream copy, no libass) |
+| in cứng / burn | `burn` | drawn into the picture (needs FFmpeg with libass) + `.srt` |
+
+- New brand kit: `init-project.mjs D --captions <mode>` stores it in `brand.json → captions.enabled/mode`. Reused series kit: the episode's own answer goes to `studio.json → captions` (`status.mjs D --captions <mode>`), which always wins.
+- `burn` without libass (Homebrew FFmpeg 8 core): init, `check-external.mjs`, `status.mjs` and `concat-and-mix.mjs` say so, and the video gets `mux` instead. Tell the user once.
+- Changing the mode later: `status.mjs D --captions <mode>` → `build-audio.mjs` → preview/render again.
+
+## Pronunciations (acronyms, brand words)
+Some voices misread capitalised acronyms: ZeroTTS (`quangminh`) swallows the last letter (PHP → "P H", TLS without S, RCE without E) and reads CA as "công an". A letter-by-letter Vietnamese spelling fixes it:
+
+```json
+"pronunciations": { "vi": { "PHP": "pi ếch pi", "PHP-FPM": "pi ếch pi ép pi em", "CA": "xi ây", "TLS": "ti eo ét", "RCE": "a xi i", "CVE": "xi vi i", "CVSS": "xi vi ét ét" } }
+```
+- Where: `brand.json → pronunciations` (a series shares it) and `studio.json → pronunciations` (this project; wins entry by entry). Keys per language (`vi`, `en`, or `default` for all).
+- Applied by `build-audio` to `lines[].text` when the line has no `say`: whole words, case-sensitive (`CA` but not `Ca` or `CAT`), longest key first in one pass, so a compound entry (`PHP-FPM`, `PHP2Shell`) wins over `PHP`. Without its own entry, `PHP` inside `PHP-FPM` is still replaced (`-` separates words; digits and letters do not).
+- Captions and `audio/manifest.json → lines[].text` keep the written text; the manifest adds `spoken` when it differs.
+- The spoken text feeds the TTS cache key and the audio hash: editing an entry re-synthesises only the lines that use it, and `--dry-run` says how many sentences the dictionary changes and how many of them need a call.
+
+## Before the first TTS call
+`build-audio.mjs D --dry-run` → "N TTS call(s) needed". If `services.tts` is not true, ask ("Gọi ZeroTTS @ <url> cho N câu nhé?"), then run with `--allow-tts` (it records the consent).
+
+## Build
+`node "$S/scripts/build-audio.mjs" D [--allow-tts]`
+- One call per sentence; cache key = spoken text (`say`, else `text` through the pronunciations) + model + voice + speed (`audio/cache/`). Editing one sentence → one call.
+- Leading/trailing silence trimmed (`audio.trim: false` to keep it).
+- Timing per scene: `lead_in` (0.3 s) + sentences separated by `sentence_pause` (0.25 s, per-line `pause_after`) + `scene_padding` (0.5 s).
+- Speaking rate: real voices can read much faster than the 2.8 words/s planning default (ZeroTTS voices measured about 4.5 words/s). `build-audio` stores the voice's measured rate in `studio.json → audio.tts.<lang>.words_per_second` (key `voice`, or `voice@speed`); voice samples fill it first when nothing better exists. `script-lint`, `status --estimate` and storyboard planning use it.
+- A scene is never shortened silently. `build-audio --tighten` proposes VO + 1.2 s (`--pad`) + the scene's scripted `> silence:`; `--tighten --apply` writes `storyboard.json` (the storyboard gate re-opens) and refits scenes from the cached sentences.
+- Scene length = max(storyboard duration, VO + padding). A longer scene gets its `data-duration` rewritten and re-renders; its keyframe approval is kept and gates 5–6 stay closed (they hash the layout only).
+- VO sync: scenes that tag elements with `data-line="<line-id>"` get `<script id="os-lines">` with each line's scene-relative start/end; `S.lines()` reveals them on cue. World scenes (`<link rel="x-world">`) always get the block, since their tagged pieces live in the world file and are timed with `S.line(id)`. Same rule: approvals kept, only those scenes re-render. After adding `data-line` by hand later: `sync-lines.mjs D [ids]`. Both warn about HyperFrames scenes that have VO lines but no `data-line` element (no line timings are written for them).
+- Outputs: `audio/vo.wav`, `captions.srt` (unless `none`; one cue per sentence, wrapped at `brand.captions.max_chars`, two lines max), `audio/manifest.json` with absolute and scene-relative line timings.
+- Spell numbers out in `say` ("thứ tư") and keep digits in `text` ("thứ 4").
+
+## Pronunciation check (speech-to-text, after build-audio)
+You cannot hear the voice-over; a local speech-to-text model can screen it.
+- Configure once: `studio.json → audio.stt.<lang>` = `{ "base_url": "http://localhost:8001", "model": "<model id>", "language": "vi", "key_env": "ONE_STUDIO_STT_KEY" }` (OpenAI-compatible `POST /v1/audio/transcriptions`; `language` defaults to the line's language).
+- Consent like TTS: `check-pronunciation.mjs D --dry-run` → "N speech-to-text call(s) needed"; ask, then `--allow-stt` (records `services.stt`). Transcripts are cached per audio + model in `audio/stt-cache/`.
+- `check-pronunciation.mjs D [line-or-scene-ids] [--all] [--json]` compares each sentence with its transcript: missing / changed words, every dictionary entry (heard written or spelled), capitalised acronyms without an entry, and a duration check (each spelled letter should add ~0.16–0.48 s after the plain words at the voice's measured rate; less means letters were probably swallowed). Report: `review/pronunciation.json`. Exit 2 when lines are flagged.
+- It is screening only: ASR models merge spelled letters ("xi vi i" → "CV") and mishear rare words. Play the flagged sentences to the user and let their ear decide before changing the dictionary.
+
+## Music (gate 7: ask when `audio.music` is `null`)
+1. `make-music.mjs D --samples [--files a.mp3,b.wav]` → built-in beds in `assets/music/` and 30 s samples with a fade-out in `review/music/*.m4a` (the user's own files too).
+2. `audio-picker.mjs D` → `review/audio-picker.html` (voices, beds and SFX side by side; "Thử giọng + nhạc" plays the bed at its ducked level under a voice). Ask: "Bạn chọn nhạc nào (hoặc không nhạc)?"
+3. `make-music.mjs D --use <bed|path|none>` → `studio.json → audio.music` (`false` = no music by choice). Gate 7 does not close while it is `null`.
+
+Built-in beds (all seamless loops, 48 kHz stereo, peak −3 dBFS, same options → identical file):
+
+| Bed | Preset | Sound |
+|---|---|---|
+| `ambient` | ambient, calm, 60 BPM, 16 s | Cmaj7–Am7–Fmaj7–G6 detuned sine pads (+octave, slow swell overlapping the next bar), eighth-note sparkle arpeggio two octaves up with exp decay, 0.33 s feedback delay (0.28) |
+| `ambient-bright` | ambient, bright | brighter progression, louder sparkle |
+| `lofi` | lofi, calm, 100 BPM, 19.2 s | soft kick on 1 and 3, swung off-beat hat, root bass, warm low-passed chords, faint vinyl dust |
+| `lofi-dark` | lofi, dark | Am7–Fmaj7–Dm7–Em7, darker filter |
+
+Custom: `make-music.mjs D --preset lofi --mood warm --bpm 90 --key D --length 30 --name my-bed` (length rounds to whole 4-bar progressions), then `--use my-bed.wav` path. Moods: `calm`, `bright`, `warm`, `dark`.
+
+In the mix the bed is looped, faded out over the last 2 s and ducked under the VO (sidechain compressor).
+
+## SFX
+Built-in kit (FFmpeg lavfi, seeded noise → identical files): `whoosh`, `swoosh`, `pop`, `click`, `ding`, `riser`, `impact` (`make-sfx.mjs --list`). Cues live on the scene in `storyboard.json`:
+
+```json
+"sfx": [
+  { "name": "whoosh", "at": 0.05 },
+  { "name": "pop", "line": "s02-2", "at": 0, "gain": -6 },
+  { "src": "assets/sfx/door.wav", "at": 3.2 }
+]
+```
+- `at` seconds from the scene start, or from the VO start of `line`; `gain` in dB (default 0).
+- Placed from `audio/manifest.json` timings (storyboard lengths before gate 7); never ducked. Built-ins are rendered into `assets/sfx/` on first use.
+- `studio.json → audio.sfx: false` mutes all cues (projects from ≤ 0.2 have `false`: set `true` when you add cues).
+- Cues are part of the audio hash: editing one re-opens gate 7, never a scene.
+
+## Mix and captions (concat-and-mix)
+- Two-pass `loudnorm` to `audio.loudness` (−14 LUFS, true peak −1.5 dB); the summary prints the measured value and the number of SFX placed.
+- Output length = the video's length exactly (a soft subtitle track can no longer shorten it).

@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+صفحة التعارف — أول شي يشوفه المستخدم الجديد (references/onboarding.md).
+
+  python3 scripts/00_onboard.py [serve] [--work DIR] [--port N] [--no-open] [--timeout SEC]
+      يفتح الصفحة بالمتصفح، ينتظر لين يضغط «احفظ» أو «تخطّ»، يحفظ
+      ~/.hibai-studio/profile.json (+ DIR/profile.json لو انعطى --work) ويطبع الـJSON ويطلع.
+      سطر «URL: …» ينطبع أول شي — لو المتصفح ما انفتح، عطه للمستخدم.
+      الرمز: 0 = انحفظ · 2 = خلص الوقت بلا إرسال · 1 = خطأ.
+  python3 scripts/00_onboard.py show            يطبع الملف المحفوظ (أو {} لو ما فيه)
+  python3 scripts/00_onboard.py theme DIR [--force]
+      يكتب DIR/theme.json من الملف (ما يلمس ثيماً موجوداً إلا بـ--force) وينسخ الشعار.
+  python3 scripts/00_onboard.py onacc DIR       يحسب لون النص فوق التمييز ويكتبه theme.onAcc (بعد ما تكتب ألواناً بيدك)
+  python3 scripts/00_onboard.py path            يطبع مسار الملف
+  python3 scripts/00_onboard.py presets         HibAI: the saved presets (name · last used)
+  python3 scripts/00_onboard.py use "Client X" --work DIR   HibAI: that preset for this video, no dashboard (then: theme DIR)
+
+  VAE_HOME=<مجلد> يغيّر مكان الحفظ (للتجربة) بدل ~/.hibai-studio
+  يشتغل على ماك وويندوز (python بدل python3 على ويندوز) — مكتبات بايثون القياسية بس.
+"""
+import base64, json, os, re, shutil, subprocess, sys, threading, time, webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+SKILL = Path(__file__).resolve().parent.parent
+PAGE = SKILL / "onboarding" / "index.html"
+HOME = Path(os.environ.get("VAE_HOME") or (Path.home() / ".hibai-studio"))
+PROFILE = HOME / "profile.json"          # the settings used last (every script reads this one)
+PRESETS = HOME / "presets"               # HibAI: named presets — presets/<id>.json (+ presets/<id>/ for its logo, fonts, background)
+VOICE_RE = re.compile(r"^[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural$")
+SAMPLE_TEXT = "هلا والله! هذا صوتي. أقدر أقرا لك سكربت الفيديو كامل، شرايك فيه؟"   # لهجة
+SAMPLE_FUSHA = "أَهْلًا بِكَ. هٰذَا صَوْتِي، وَأَسْتَطِيعُ أَنْ أَقْرَأَ لَكَ نَصَّ الْفِيدْيُو كَامِلًا بِوُضُوح."   # فصحى مشكّلة — تطلع بلا غلط
+LOGO_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/svg+xml": ".svg"}
+
+# نفس لوحات الصفحة — لو وصل palette بلا colors نرجع لها
+PALETTES = {
+    "night-gold":   dict(bg="#101828", ink="#F5F7FA", acc="#F2B33D", clay="#C98B18", mut="#98A2B3"),
+    "paper-indigo": dict(bg="#F7F8FC", ink="#111827", acc="#3B5BFD", clay="#2A3FC0", mut="#6B7280"),
+    "sunset":       dict(bg="#1B0F0A", ink="#FFF4EC", acc="#FF7A1A", clay="#D45A00", mut="#B39484"),
+    "deep-mint":    dict(bg="#0B2A26", ink="#EAF6F2", acc="#3DDC97", clay="#1FA774", mut="#8FB5AA"),
+    "plum-pink":    dict(bg="#1A1030", ink="#F7F2FF", acc="#FF5C8A", clay="#D63A6A", mut="#A89BC2"),
+    "white-red":    dict(bg="#FFFFFF", ink="#0A0A0A", acc="#FF3B30", clay="#C62A22", mut="#737373"),
+    "ocean":        dict(bg="#06283D", ink="#EAF4FB", acc="#47B5FF", clay="#1C82C9", mut="#8BA9BD"),
+    "white-teal":   dict(bg="#F4F8F8", ink="#0B1F24", acc="#0E9C9C", clay="#0A7575", mut="#5E7479"),
+}
+LRM = "\u200e"   # علامة اتجاه يسار←يمين غير مرئية: تثبّت @ أول الحساب داخل رسم عربي (بدونها يطلع my.brand@)
+CTA_MAX = 16     # أطول جملة بالسطر الكبير (900 88px) بكرت النهاية — قياس 28 سبتمبر: أعرض خط (نوتو كوفي) ≈ 55px للحرف ← 16 حرف ≈ 880 من 1080
+SMALL_MAX = 34   # أطول سطر رمادي صغير (700 40px) — الجملة الأطول تنقسم سطرين (l1 + l2)
+
+
+def split_small(txt):
+    """جملة طويلة ← سطرين متوازنين على حدود الكلمات (l1, l2)."""
+    if len(txt) <= SMALL_MAX:
+        return txt, ""
+    w = txt.split()
+    best = None
+    for i in range(1, len(w)):
+        a, b = " ".join(w[:i]), " ".join(w[i:])
+        score = max(len(a), len(b))
+        if best is None or score < best[0]:
+            best = (score, a, b)
+    if not best:
+        return txt[:SMALL_MAX], ""
+    return best[1], best[2]
+
+
+CAP_STYLES = {"card", "shadow", "big", "underline", "bar", "type"}
+HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def _lum(h):
+    c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def contrast(a, b):
+    x, y = _lum(a), _lum(b)
+    return (max(x, y) + 0.05) / (min(x, y) + 0.05)
+
+
+def on_accent(acc, ink, bg):
+    """لون النص فوق لون التمييز — نفس القاعدة بالصفحة (onColor) حرفياً:
+    الأوضح من ألوانه (ink/bg) لو تباينه 4.5 وفوق، وإلا الأوضح من ألوانه + الأبيض + الأسود."""
+    best = max((ink, bg), key=lambda c: contrast(c, acc))
+    if contrast(best, acc) >= 4.5:
+        return best
+    return max((ink, bg, "#FFFFFF", "#111111"), key=lambda c: contrast(c, acc))
+
+
+def ensure_previews(moves_dir):
+    """ملف البلقن (رفع تطبيق كلود، حد 200 ملف) يحمل المعاينات zip واحد — نفكّه أول مرة."""
+    import zipfile
+    d, z = moves_dir / "previews", moves_dir / "previews.zip"
+    if z.exists():                                        # يفك الناقص بس (تحديث البنك يضيف معاينات جديدة لمجلد مفكوك من قبل)
+        d.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(z) as f:
+            for n in f.namelist():
+                if n.endswith(".mp4") and "/" not in n.strip("/").replace("previews/", "", 1) and not (d / Path(n).name).exists():
+                    (d / Path(n).name).write_bytes(f.read(n))
+
+
+def pslug(name):
+    s = re.sub(r"[^\w-]+", "-", str(name or "").strip().lower(), flags=re.UNICODE).strip("-")
+    return s[:40] or "preset"
+
+
+def load_preset(pid):
+    try:
+        return json.loads((PRESETS / (pslug(pid) + ".json")).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def migrate_presets():
+    """older installs had one saved profile — it becomes the preset «My settings» (once), so a new preset never hides it"""
+    if PRESETS.is_dir() and any(PRESETS.glob("*.json")):
+        return
+    p = load_profile()
+    if p and not p.get("skip"):
+        p = dict(p); p.setdefault("presetName", "My settings"); p["presetId"] = pslug(p["presetName"])
+        atomic_write(PRESETS / (p["presetId"] + ".json"), json.dumps(p, ensure_ascii=False, indent=2))
+
+
+def list_presets():
+    """all saved presets, the one used last first"""
+    migrate_presets()
+    out = []
+    if PRESETS.is_dir():
+        for f in PRESETS.glob("*.json"):
+            try:
+                p = json.loads(f.read_text(encoding="utf-8")); p["presetId"] = f.stem; out.append(p)
+            except Exception:
+                pass
+    if not out:
+        p = load_profile()
+        if p and not p.get("skip"):
+            p = dict(p); p.setdefault("presetName", "My settings"); p["presetId"] = pslug(p["presetName"]); out.append(p)
+    out.sort(key=lambda p: p.get("lastUsed") or p.get("savedAt") or "", reverse=True)
+    return out
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def load_profile():
+    try:
+        return json.loads(PROFILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def clean(obj, work=None):
+    """ينظّف الإرسال: يحفظ الشعار ملفاً، ويتأكد من الألوان والقيم.
+    HibAI: remember=false ('only for this video') → uploads go to <work>/hibai-uploads, the saved profile stays untouched."""
+    if not isinstance(obj, dict):
+        raise ValueError("المدخل مو كائن JSON")
+    obj = dict(obj)
+    obj["remember"] = obj.get("remember", True) is not False
+    obj.pop("reused", None)                      # only for the page's «done» message
+    name = str(obj.get("presetName") or "").strip()[:40] or "My settings"   # same name = update that preset · new name = a new one
+    pid = pslug(name)
+    if obj["remember"]: obj["presetName"], obj["presetId"] = name, pid
+    else: obj.pop("presetName", None); obj.pop("presetId", None)   # «only this video»: not a preset
+    store = (PRESETS / pid) if (obj["remember"] or not work) else Path(work) / "hibai-uploads"
+    obj.setdefault("version", 1)
+    obj["savedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    if obj.get("skip"):
+        note = str(obj.get("note") or "")[:4000]
+        prev = load_profile()
+        if prev and not prev.get("skip"):
+            # مستخدم راجع ضغط «تخطّ» = خلّ اختياراتي القديمة كما هي، بس حدّث الملاحظة
+            prev.update(note=note, savedAt=obj["savedAt"], keptPrevious=True)
+            return prev
+        return {"version": 1, "skip": True, "note": note, "savedAt": obj["savedAt"]}
+    obj["note"] = str(obj.get("note") or "")[:4000]
+    idn = dict(obj.get("identity") or {"mode": "auto"})
+    if idn.get("mode") == "palette" and not idn.get("colors"):
+        idn["colors"] = PALETTES.get(idn.get("palette"))
+    cols = idn.get("colors")
+    if cols is not None:
+        if not isinstance(cols, dict) or not all(HEX.match(str(cols.get(k, ""))) for k in ("bg", "ink", "acc")):
+            raise ValueError("ألوان غير صالحة")
+    lg = idn.get("logo")
+    if isinstance(lg, dict) and str(lg.get("data", "")).startswith("data:"):
+        head, _, b64 = lg["data"].partition(",")
+        mime = head[5:].split(";")[0]
+        ext = LOGO_EXT.get(mime)
+        if not ext:
+            raise ValueError("صيغة الشعار مو مدعومة")
+        raw = base64.b64decode(b64)
+        if len(raw) > 8 * 1024 * 1024:
+            raise ValueError("الشعار كبير")
+        store.mkdir(parents=True, exist_ok=True)
+        for old in store.glob("logo.*"):
+            old.unlink()
+        dst = store / ("logo" + ext)
+        dst.write_bytes(raw)
+        idn["logo"] = str(dst)
+    elif lg is not None and not isinstance(lg, str):
+        idn.pop("logo", None)
+    elif lg is None:
+        prev = (load_preset(pid) or load_profile() or {}).get("identity", {}) or {}
+        if isinstance(prev.get("logo"), str) and Path(prev["logo"]).exists():
+            idn["logo"] = prev["logo"]  # ما رفع شعاراً جديداً = نخلي القديم
+    obj["identity"] = idn
+    hb = obj.get("hibai") if isinstance(obj.get("hibai"), dict) else None
+    if hb:   # HibAI dashboard uploads: font (.ttf/.otf) and background image → files next to the profile
+        for key, stem, kinds in (("latinFontUpload", "latin-font-upload", {"font/ttf": ".ttf", "font/otf": ".otf", "font/sfnt": ".ttf",
+                                   "application/x-font-ttf": ".ttf", "application/x-font-otf": ".otf", "application/vnd.ms-opentype": ".otf",
+                                   "application/octet-stream": None}),
+                                 ("fontUpload", "font-upload", {"font/ttf": ".ttf", "font/otf": ".otf", "font/sfnt": ".ttf",
+                                   "application/x-font-ttf": ".ttf", "application/x-font-otf": ".otf", "application/vnd.ms-opentype": ".otf",
+                                   "application/octet-stream": None}),
+                                 ("bgImage", "bg-upload", {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"})):
+            v = hb.get(key)
+            if isinstance(v, dict) and str(v.get("data", "")).startswith("data:"):
+                head, _, b64 = v["data"].partition(",")
+                mime = head[5:].split(";")[0]
+                ext = kinds.get(mime) or (Path(str(v.get("name", ""))).suffix.lower() if mime in kinds or key in ("fontUpload", "latinFontUpload") else None)
+                if ext not in (".ttf", ".otf", ".png", ".jpg", ".webp"):
+                    raise ValueError("صيغة الملف مو مدعومة: " + str(v.get("name", "")))
+                raw = base64.b64decode(b64)
+                if len(raw) > 8 * 1024 * 1024:
+                    raise ValueError("الملف كبير")
+                store.mkdir(parents=True, exist_ok=True)
+                for old in store.glob(stem + ".*"):
+                    old.unlink()
+                dst = store / (stem + ext)
+                dst.write_bytes(raw)
+                hb[key] = str(dst)
+            elif v is not None and not isinstance(v, str):
+                hb.pop(key, None)
+        obj["hibai"] = hb
+    if obj.get("capStyle") not in CAP_STYLES | {"auto"}:
+        obj["capStyle"] = "auto"
+    if obj.get("digits") not in ("western", "arabic"):
+        obj["digits"] = "western"
+    v = obj.get("voice") or {}
+    if v.get("tts") and not VOICE_RE.match(str(v["tts"])):
+        v["tts"] = None
+    obj["voice"] = v
+    return obj
+
+
+def save(obj, work):
+    migrate_presets()
+    old = load_profile() or {}
+    if "moves" in old and "moves" not in obj:      # اختيار معرض الحركات (35_moves.py) ما ينمسح لو عاد صفحة التعارف
+        obj["moves"] = old["moves"]
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    paths = []
+    if obj.get("remember", True) or obj.get("skip") or not work:   # «save for my next videos» (default) → its preset + the settings used last
+        if not obj.get("skip"):
+            obj["lastUsed"] = obj.get("savedAt")
+            text = json.dumps(obj, ensure_ascii=False, indent=2)
+            pf = PRESETS / (obj.get("presetId") or pslug(obj.get("presetName"))) 
+            atomic_write(pf.with_suffix(".json"), text)
+            paths.append(str(pf.with_suffix(".json")))
+        atomic_write(PROFILE, text)
+        paths.append(str(PROFILE))
+    if work:
+        wp = Path(work) / "profile.json"
+        atomic_write(wp, text)
+        paths.append(str(wp))
+    return paths
+
+
+def voice_sample(name, lang="fusha"):
+    """عيّنة صوت edge-tts (مجانية، تحتاج نت) — تنحفظ كاش. lang: fusha (افتراضي، بلا غلط) أو dialect."""
+    cache = HOME / "voice-samples"
+    cache.mkdir(parents=True, exist_ok=True)
+    lang = "dialect" if lang == "dialect" else "fusha"
+    text = SAMPLE_TEXT if lang == "dialect" else SAMPLE_FUSHA
+    out = cache / (name + "-" + lang + ".mp3")
+    if out.exists() and out.stat().st_size > 1000:
+        return out
+    cmds = [[sys.executable, "-m", "edge_tts"]]
+    if shutil.which("edge-tts"):
+        cmds.append(["edge-tts"])
+    err = ""
+    for c in cmds:
+        try:
+            r = subprocess.run(c + ["--voice", name, "--text", text, "--write-media", str(out)],
+                               capture_output=True, text=True, timeout=40)
+            if r.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+                return out
+            err = (r.stderr or r.stdout)[-300:]
+        except Exception as e:  # noqa
+            err = str(e)
+    if out.exists():
+        out.unlink()
+    raise RuntimeError(err or "edge-tts ما اشتغل")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "vae-onboard"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, ensure_ascii=False)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path in ("/", "/index.html"):
+            return self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
+        if u.path == "/favicon.ico":
+            return self._send(204, b"", "image/x-icon")
+        if u.path == "/motion/backgrounds.js":       # live background previews (same code as the video engine)
+            f = SKILL / "motion" / "backgrounds.js"
+            return self._send(200, f.read_bytes(), "text/javascript; charset=utf-8")
+        if u.path.startswith("/fonts/"):               # font previews in the dashboard (motion/fonts, read-only)
+            f = (SKILL / "motion" / "fonts" / Path(u.path[len("/fonts/"):]).name)
+            if f.suffix.lower() in (".ttf", ".otf") and f.exists():
+                return self._send(200, f.read_bytes(), "font/ttf" if f.suffix.lower() == ".ttf" else "font/otf")
+            return self._send(404, b"", "text/plain")
+        if u.path == "/assets/pfp.png":              # HibAI footer photo
+            f = SKILL / "onboarding" / "assets" / "pfp.png"
+            return self._send(200, f.read_bytes(), "image/png") if f.exists() else self._send(404, b"", "text/plain")
+        if u.path.startswith("/moves/"):            # بنك الحركات للفرجة (motion/moves) — قراءة بس
+            base = (SKILL / "motion" / "moves").resolve()
+            ensure_previews(base)
+            f = (base / (u.path[len("/moves/"):] or "index.html")).resolve()
+            ct = {".html": "text/html; charset=utf-8", ".json": "application/json; charset=utf-8", ".mp4": "video/mp4", ".jpg": "image/jpeg"}.get(f.suffix)
+            if ct and (base == f.parent or base in f.parents) and f.is_file():
+                return self._send(200, f.read_bytes(), ct)
+            return self._send(404, {"ok": False})
+        if u.path == "/api/state":                 # لصفحة بنك الحركات (نفس شكل 35_moves.py)
+            p = load_profile() or {}
+            return self._send(200, {"moves": p.get("moves") or {"on": [], "off": []}, "colors": ((p.get("identity") or {}).get("colors")) or {}})
+        if u.path == "/api/ping":
+            return self._send(200, {"ok": True})
+        if u.path == "/api/presets":
+            return self._send(200, list_presets())
+        if u.path == "/api/profile":
+            p = load_profile()
+            return self._send(200, p or {})
+        if u.path == "/api/logo":
+            p = (load_profile() or {}).get("identity", {}) or {}
+            lg = p.get("logo")
+            if isinstance(lg, str) and Path(lg).exists():
+                ext = Path(lg).suffix.lower()
+                ct = {v: k for k, v in LOGO_EXT.items()}.get(ext, "application/octet-stream")
+                return self._send(200, Path(lg).read_bytes(), ct)
+            return self._send(404, {"ok": False})
+        if u.path == "/api/voice":
+            name = (parse_qs(u.query).get("v") or [""])[0]
+            lang = (parse_qs(u.query).get("lang") or ["fusha"])[0]
+            if not VOICE_RE.match(name):
+                return self._send(400, "اسم صوت غير صالح", "text/plain; charset=utf-8")
+            try:
+                return self._send(200, voice_sample(name, lang).read_bytes(), "audio/mpeg")
+            except Exception as e:
+                log("⚠️ عيّنة الصوت فشلت:", str(e)[-200:])
+                return self._send(503, "voice sample failed", "text/plain; charset=utf-8")
+        return self._send(404, {"ok": False})
+
+    def do_POST(self):
+        if urlparse(self.path).path == "/api/save":          # اختيار الحركات من صفحة البنك — يدمج بالبروفايل وما يسكّر السيرفر
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            origin, host = self.headers.get("Origin"), self.headers.get("Host") or ""
+            if ctype != "application/json" or (origin and origin != "http://" + host):
+                return self._send(403, {"ok": False, "error": "forbidden"})
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                o = json.loads(self.rfile.read(min(n, 65536)).decode("utf-8"))
+                ids = {m["id"] for m in json.loads((SKILL / "motion" / "moves" / "catalog.json").read_text(encoding="utf-8"))["moves"]}
+                on = [i for i in dict.fromkeys(o.get("on") or []) if i in ids]
+                off = [i for i in dict.fromkeys(o.get("off") or []) if i in ids and i not in on]
+                p = load_profile() or {}
+                p["moves"] = {"on": on, "off": off}
+                atomic_write(PROFILE, json.dumps(p, ensure_ascii=False, indent=2))
+                if p.get("presetId") and load_preset(p["presetId"]) is not None:   # keep the preset in step
+                    atomic_write(PRESETS / (pslug(p["presetId"]) + ".json"), json.dumps(p, ensure_ascii=False, indent=2))
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": str(e)})
+            return self._send(200, {"ok": True})
+        if urlparse(self.path).path == "/api/preset-delete":      # HibAI: delete one named preset (and its files)
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            origin, host = self.headers.get("Origin"), self.headers.get("Host") or ""
+            if ctype != "application/json" or (origin and origin != "http://" + host):
+                return self._send(403, {"ok": False, "error": "forbidden"})
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                pid = pslug(json.loads(self.rfile.read(min(n, 4096)).decode("utf-8")).get("id"))
+                (PRESETS / (pid + ".json")).unlink(missing_ok=True)
+                if (PRESETS / pid).is_dir(): shutil.rmtree(PRESETS / pid, ignore_errors=True)
+                last = load_profile() or {}
+                if pslug(last.get("presetId") or last.get("presetName") or "my settings") == pid: PROFILE.unlink(missing_ok=True)
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": str(e)})
+            return self._send(200, {"ok": True})
+        if urlparse(self.path).path != "/api/submit":
+            return self._send(404, {"ok": False})
+        # صفحة ثانية مفتوحة بالمتصفح ما تقدر ترسل لنا: لازم JSON (يجبر المتصفح على فحص مسبق)
+        # والأصل (Origin) لو موجود لازم يكون نفس السيرفر
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host") or ""
+        if ctype != "application/json" or (origin and origin != "http://" + host):
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 12 * 1024 * 1024:
+                raise ValueError("الإرسال كبير")
+            obj = clean(json.loads(self.rfile.read(n).decode("utf-8")), self.server.work)
+            paths = save(obj, self.server.work)
+        except Exception as e:
+            log("⚠️ ما انحفظ:", e)
+            return self._send(400, {"ok": False, "error": str(e)})
+        self._send(200, {"ok": True})
+        self.server.result = (obj, paths)
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+
+def serve(args):
+    work = None
+    port = 0
+    do_open = True
+    timeout = 1800
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--work":
+            work = args[i + 1]; i += 1
+        elif a == "--port":
+            port = int(args[i + 1]); i += 1
+        elif a == "--no-open":
+            do_open = False
+        elif a == "--timeout":
+            timeout = int(args[i + 1]); i += 1
+        i += 1
+    if not PAGE.exists():
+        log("⛔ ما لقيت الصفحة:", PAGE)
+        return 1
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.work, srv.result = work, None
+    url = "http://127.0.0.1:%d/" % srv.server_address[1]
+    print("URL: " + url, flush=True)
+    if do_open:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    timer = threading.Timer(timeout, srv.shutdown)
+    timer.daemon = True
+    timer.start()
+    try:
+        srv.serve_forever(poll_interval=0.3)
+    except KeyboardInterrupt:
+        pass
+    timer.cancel()
+    srv.server_close()
+    if not srv.result:
+        log("⏱️ خلص الوقت وما وصل شي — المستخدم ما ضغط حفظ.")
+        return 2
+    obj, paths = srv.result
+    log("✅ انحفظ: " + " · ".join(paths))
+    print(json.dumps(obj, ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
+def set_on_acc(t):
+    """يكتب theme.onAcc (لون النص فوق التمييز) — المحرّك بدونه يختار أبيض/INK بقاعدة تطلع أبيض على ليموني."""
+    if not all(HEX.match(str(t.get(k, ""))) for k in ("bg", "ink", "acc")):
+        return None
+    t["onAcc"] = on_accent(t["acc"].upper(), t["ink"].upper(), t["bg"].upper())
+    c = contrast(t["onAcc"], t["acc"].upper())
+    if c < 3:
+        log("⚠️ لون التمييز %s ما يطلع عليه نص واضح (تباين %.1f) — قل له واقترح لون تمييز أغمق أو أفتح" % (t["acc"], c))
+    cb = contrast(t["acc"].upper(), t["bg"].upper())
+    if cb < 1.8:   # نفس حد تحذير الصفحة (cwarn)
+        log("⚠️ لون التمييز %s قريب من الخلفية %s (تباين %.1f) — الخط تحت الكلمة والتظليل ما راح يبانون: قل له" % (t["acc"], t["bg"], cb))
+    return t["onAcc"]
+
+
+def fix_on_acc(args):
+    """بعد ما تكتب الألوان بيدك (رابط/سؤال): يحسب onAcc ويكتبه بـ<work>/theme.json."""
+    if not args:
+        log("الاستخدام: 00_onboard.py onacc <work>")
+        return 1
+    tp = Path(args[0]) / "theme.json"
+    try:
+        t = json.loads(tp.read_text(encoding="utf-8"))
+    except Exception:
+        log("⛔ ما قدرت أقرا " + str(tp))
+        return 1
+    if not set_on_acc(t):
+        log("⛔ theme.json ناقصه bg/ink/acc بصيغة #RRGGBB")
+        return 1
+    atomic_write(tp, json.dumps(t, ensure_ascii=False, indent=2))
+    print(t["onAcc"])
+    return 0
+
+
+def to_theme(args):
+    """profile.json → theme.json (المحرّك يقرا theme.json بس)."""
+    if not args:
+        log("الاستخدام: 00_onboard.py theme <work> [--force]")
+        return 1
+    work = Path(args[0])
+    force = "--force" in args
+    p = None
+    wp = work / "profile.json"                    # this video's dashboard answers win (they may be «only for this video»)
+    if wp.exists():
+        try: p = json.loads(wp.read_text(encoding="utf-8"))
+        except Exception: p = None
+    p = p or load_profile()
+    if not p or p.get("skip"):
+        log("ما فيه اختيارات محفوظة (أو تخطّى) — اسأل عن الألوان سؤالاً واحداً بدلها.")
+        return 3
+    tp = work / "theme.json"
+    if tp.exists() and not force:
+        log("⛔ فيه theme.json من قبل — ما لمسته (القاعدة: لا تغيّر ثيماً سابقاً إلا بطلبه). --force لو طلب.")
+        return 4
+    t = {}
+    if tp.exists():
+        try:
+            t = json.loads(tp.read_text(encoding="utf-8"))
+        except Exception:
+            t = {}
+    idn = p.get("identity") or {}
+    cols = idn.get("colors")
+    if cols:
+        for k in ("bg", "ink", "acc", "clay", "mut"):
+            if cols.get(k):
+                t[k] = cols[k]
+    missing_colors = not cols
+    if p.get("font") and p["font"] != "auto":
+        t["font"] = p["font"]
+    if p.get("capStyle") in CAP_STYLES:
+        t["capStyle"] = p["capStyle"]
+    if p.get("pace") == "calm":
+        t["pace"] = "calm"
+    elif "pace" in t and p.get("pace") in ("fast", "hyper"):
+        t.pop("pace")
+    ec = p.get("endCard") or {}
+    if ec.get("handle"):
+        h = ec["handle"].strip()
+        t["handle"] = h if h.startswith("@") else "@" + h
+    if ec.get("on"):
+        # ⛔ كرت الختام الافتراضي بالمحرّك = إعلان السكل نفسه («علّق بكلمة فيديو»). نكتب الكرت كامل
+        #    (كل الحقول) حتى ما يتسرّب منه سطر. شكل الكرت: l1 سطر رمادي صغير فوق · cta السطر الكبير ·
+        #    word داخل القرص الملوّن · الحساب سطر تحت (theme.handle) — المحرّك يرسمها كذا (compose: outro()).
+        mine = " ".join((ec.get("cta") or "").split())
+        word, h = (ec.get("word") or "").strip(), t.get("handle", "")
+        short = mine if (mine and len(mine) <= CTA_MAX) else ""
+        # جملته الطويلة ما تنضغط بالسطر الكبير — تنزل للسطرين الرماديين فوق (l1/l2)
+        l1, l2 = split_small(mine) if (mine and not short) else ("", "")
+        if word:
+            o = dict(l1=l1, l2=l2, chips=[], cta=short or "علّق بكلمة", word=word, sub="")
+        elif h:
+            # الحساب داخل القرص: محاط بعلامة LRM وإلا المحرّك (نص عربي) يقلبه my.brand@
+            o = dict(l1=l1, l2=l2, chips=[], cta=short or "تابعني", word=LRM + h + LRM, sub="")
+        else:
+            o = dict(l1=l1, l2=l2, chips=[], cta=short or "تابعني", word="", sub="")
+            log("⚠️ كرت النهاية بلا كلمة ولا حساب — القرص الملوّن بيطلع فاضي: اسأله عن حسابه أو اكتب outro.word بنفسك")
+        t["outro"] = o
+    else:
+        log("ℹ️ ما يبي كرت نهاية ← حط \"outro\": 0 بـsfx.json")
+    # HibAI dashboard extras — the engine reads bar / capStill; the rest is for Claude (see SKILL.md)
+    hb = p.get("hibai") or {}
+    if hb.get("bar") is False:
+        t["bar"] = False
+    if hb.get("vibe") == "luxury":
+        t["capStill"] = True
+        t["bar"] = False
+    set_on_acc(t)
+    cp = work / "compose.html"
+    if cp.exists() and "ONACC" not in cp.read_text(encoding="utf-8", errors="ignore"):
+        log("⚠️ compose.html بالمجلد نسخة قديمة ما تعرف onAcc — انسخ scripts/compose.REFERENCE.html من جديد (لو ما صمّمت فيه مشاهد بعد)")
+    lg = idn.get("logo")
+    if isinstance(lg, str) and Path(lg).exists():
+        work.mkdir(parents=True, exist_ok=True)
+        dst = work / ("logo" + Path(lg).suffix.lower())
+        shutil.copyfile(lg, dst)
+        t["logo"] = dst.name
+    t.setdefault("grade", False)
+    t.setdefault("badgeUntil", 0)
+    t.setdefault("faceAnchor", 0.30)
+    # HibAI captions: words per screen (2 = 1–2 · 4 = 3–4), smaller size, Latin words in a Latin font
+    hb = p.get("hibai") or {}
+    t["capWords"] = int(hb.get("capWords") or t.get("capWords") or 4)
+    t.setdefault("capScale", 0.8)
+    t["latinFont"] = hb.get("latinFont") or t.get("latinFont") or "Inter"
+    fu = hb.get("fontUpload")                                      # uploaded font → used as the Arabic/Darija font
+    if isinstance(fu, str) and Path(fu).exists():
+        work.mkdir(parents=True, exist_ok=True); shutil.copyfile(fu, work / Path(fu).name); t["font"] = Path(fu).name
+    lu = hb.get("latinFontUpload")                                 # uploaded Latin font → Latin words
+    if isinstance(lu, str) and Path(lu).exists():
+        work.mkdir(parents=True, exist_ok=True); shutil.copyfile(lu, work / Path(lu).name); t["latinFont"] = Path(lu).name
+    if hb.get("capFx") == "font":                                  # key words in another font + the accent colour
+        t["hotFont"] = "Lalezar" if (t.get("font") or "") != "Lalezar" else "KO Mission"
+    else:
+        t.pop("hotFont", None)
+    if hb.get("capFx") == "big":
+        t["capWords"] = 1
+    bgc = hb.get("bg") or {}                                        # background style for split / full-visual scenes
+    if bgc.get("style") and bgc["style"] != "auto":
+        t["bgStyle"] = bgc["style"]
+        if bgc["style"] == "color" and bgc.get("color"): t["bgColor"] = bgc["color"]
+        t["bgBrand"] = bgc.get("brand", True) is not False
+    bi = hb.get("bgImage")
+    if isinstance(bi, str) and Path(bi).exists():
+        work.mkdir(parents=True, exist_ok=True); shutil.copyfile(bi, work / Path(bi).name); t["bgImage"] = Path(bi).name
+        t["bgStyle"] = "image"
+    if hb.get("layout") and hb["layout"] != "auto":                # how the speaker and the visuals share the screen
+        t["layout"] = hb["layout"]
+        if hb["layout"] == "pip": t["pip"] = hb.get("pip") or "circle"
+    if hb.get("light") == "improve":
+        t["grade"] = "auto"
+    atomic_write(tp, json.dumps(t, ensure_ascii=False, indent=2))
+    # local fonts → <work>/fonts + fontFile / latinFontFile (works offline)
+    subprocess.run([sys.executable, str(Path(__file__).with_name("39_fonts.py")), str(work)])
+    t = json.loads(tp.read_text(encoding="utf-8"))
+    log("✅ كتبت " + str(tp) + ("" if not missing_colors else "  ⚠️ بلا ألوان — ناقص bg/ink/acc (رابط أو تلقائي): طلّعها قبل الرسم"))
+    print(json.dumps(t, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a and not a[0].startswith("--") else "serve"
+    rest = a[1:] if a and not a[0].startswith("--") else a
+    if cmd == "serve":
+        return serve(rest)
+    if cmd == "show":
+        print(json.dumps(load_profile() or {}, ensure_ascii=False, indent=2))
+        return 0
+    if cmd == "presets":                                     # HibAI: list the saved presets
+        for p in list_presets():
+            print(f"{p.get('presetName')}  ·  {p.get('lastUsed') or p.get('savedAt') or ''}")
+        return 0
+    if cmd == "use":                                         # use <preset name> --work DIR → that preset for this video (no dashboard)
+        name = " ".join(x for i, x in enumerate(rest) if x != "--work" and (i == 0 or rest[i - 1] != "--work"))
+        work = rest[rest.index("--work") + 1] if "--work" in rest else None
+        p = next((x for x in list_presets() if pslug(x.get("presetName")) == pslug(name)), None)
+        if not p:
+            log("⛔ no preset called «" + name + "» — saved: " + ", ".join(x.get("presetName", "") for x in list_presets())); return 3
+        p = dict(p, lastUsed=time.strftime("%Y-%m-%dT%H:%M:%S%z"), remember=True)
+        print("\n".join(save(p, work)))
+        return 0
+    if cmd == "path":
+        print(PROFILE)
+        return 0
+    if cmd == "theme":
+        return to_theme(rest)
+    if cmd == "onacc":
+        return fix_on_acc(rest)
+    log(__doc__)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

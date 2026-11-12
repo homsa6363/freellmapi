@@ -1,0 +1,1101 @@
+#!/usr/bin/env python3
+"""sweety-statechart-video: animated crayon statecharts, played like Ann Nguyen's "the making of nhang".
+A film is a film.json (chapters: states, arrows, steps with captions) and a scenes.js (the living pictures around
+each chart, drawn in JavaScript with the crayon kit). Narration in one of the skill's own voices; 3:4 by default.
+
+usage: scv.py <command> JOB [options]
+  new       JOB [--title T]   a job folder with a film.json and scenes.js to fill in
+  import    SRC JOB [--format xstate|mermaid|scxml|plantuml] [--title T]
+                              a job folder from an existing state machine (scripts/statechart_io.py)
+  export    JOB --to mermaid|xstate|scxml [-o FILE]   the film's charts back as code
+  check     JOB               structure, step references, captions, the rule checker (it finds the red path)
+  layout    JOB               every chapter's finished poster with a grid + free areas (work/layout/), for scenes.js
+  lint      JOB               picture checks with fixes: overlaps, blank paper, still steps, people, theme (work/lint.json)
+  draft     JOB [--write]     scenes.draft.js from the layout: a set piece and props in the free areas (scene_draft.py)
+  gallery   [--out DIR]       contact sheets of every prop, person and set piece (scripts/gallery.py)
+  lines     JOB               work/lines.json: one narration line per captioned step
+  voice     JOB [--redo ID]   synthesize, gate and ASR-check the lines (scripts/voice.py, MLX Python)
+  plan      JOB               step times (from the voice, or the reference pace), work/timing.json + timeline.json
+  stills    JOB [--at t,..]   frames to work/stills/ + contact sheet (default: late in every step)
+  render    JOB [--workers N] [--start S --end E]   frames -> work/render/video.mp4
+  posters   JOB               finished posters -> outputs/posters/, outputs/cover.png
+  finalize  JOB               cover intro + sound (voice / music / sfx) + mux -> outputs/film.mp4, film-master.mp4, shifted captions.srt, script.txt
+  all       JOB               check, lines, voice, plan, render, posters, finalize (+ deliver, publish)
+  deliver   JOB [--what clips,longimage,html,gif,site,social]   more outputs from the same render (scripts/deliver.py)
+  publish   JOB               outputs/publish/: titles, description, tags, chapter times, platform notes (publish.py)
+  preview   JOB [--port N] [--open]   the film in a player on 127.0.0.1, with sound; reloads on edits (preview.py)
+  golden    [--update]        the three examples at fixed times against tests/golden/ (scripts/golden.py)
+  batch     JOB [JOB...]      `all` for each job, then a summary
+  voices                      list the voices
+  add-voice ID --audio F --text T --consent self|authorized [--start S --end E] [--preview]
+                              add your own voice (scripts/add_voice.py)
+  any JOB command takes --lang CODE: the translated version (film.json "i18n") in JOB/lang/CODE/ (scripts/i18n.py)
+"""
+import argparse
+import base64
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import modelcheck
+import i18n
+import audio_plan
+
+SKILL = Path(__file__).resolve().parent.parent
+ENGINE = SKILL / 'engine'
+CRAYON = ENGINE / 'crayon'
+FONTS = ENGINE / 'fonts'
+SCRIPTS = SKILL / 'scripts'
+OWN_VENV = Path.home() / '.local/share/sweety-statechart-video/venv/bin/python'      # made by scripts/setup.sh
+RENDER_PY = os.environ.get('SCV_PYTHON') or str(OWN_VENV if OWN_VENV.exists() else Path.home() / '.local/share/sweety-handdraw-video/venv/bin/python')
+MLX_PY = os.environ.get('STATECHART_MLX_PYTHON', str(Path.home() / '.local/share/voxcpm2-mlx/.venv/bin/python3'))
+ASPECT_RE = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*[:：x×/]\s*(\d+(?:\.\d+)?)\s*$')
+RATIO_LIMITS = (0.4, 2.5)                       # height / width
+
+
+def aspect_ratio(text):
+    """'3:4', '16:9', '2.35:1', '4x5', '9／16' -> height / width, or None when unreadable or too extreme."""
+    m = ASPECT_RE.match(str(text or '3:4').replace('／', '/'))
+    if not m or float(m[1]) <= 0 or float(m[2]) <= 0:
+        return None
+    r = float(m[2]) / float(m[1])
+    return r if RATIO_LIMITS[0] <= r <= RATIO_LIMITS[1] else None
+
+
+def frame_size(spec):
+    """(W, H) in pixels: an explicit "size", or the aspect with the short side at 1080 (both sides even)."""
+    if spec.get('size'):
+        w, h = spec['size']
+        return int(w) // 2 * 2, int(h) // 2 * 2
+    r = aspect_ratio(spec.get('aspect', '3:4')) or 4 / 3
+    if r >= 1:
+        return 1080, round(1080 * r / 2) * 2
+    return round(1080 / r / 2) * 2, 1080
+ENGINE_FILES = ['ink.js', 'theme.js', 'chart.js', 'layout.js', 'people.js', 'props.js', 'sets.js', 'motion.js', 'film.js', 'player.js', 'lint.js', 'main.js']
+ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
+CAPTION_MAX = 24
+FPS = 30
+COVER_HOLD_SECONDS, COVER_FADE_SECONDS = .5, .5
+DIGITS = re.compile(r'\d')
+LEAD, GAP, CHAPTER_GAP, VOICE_AT = 1.0, .35, .25, .12
+DURATION_DEFAULT = (120.0, 180.0)              # 2-3 minutes: what most short-video feeds reward
+MAX_STRETCH = .7                                # at most this much extra hold per step to reach the target
+READ_BASE, READ_CPS = .5, 7.                     # a silent step lasts at least this long: time to read its caption
+SPOKEN = re.compile(r'[，。！？；：、“”‘’（）《》〈〉【】—…·,.!?;:"\'()\[\]\s↓→]')
+
+
+def target_duration(spec):
+    """(min, max) seconds from "duration": 150 | [120, 180] | "2-3分钟" | "90秒" | "1.5 min"; default 2-3 minutes."""
+    d = spec.get('duration')
+    if d is None:
+        return DURATION_DEFAULT if voice_of(spec) else (0., 1e9)   # a silent film keeps the reference's brisk pace
+    if isinstance(d, (int, float)):
+        return (d * .9, d * 1.1)
+    if isinstance(d, (list, tuple)) and len(d) == 2:
+        return (float(d[0]), float(d[1]))
+    text = str(d).lower()
+    nums = [float(x) for x in re.findall(r'\d+(?:\.\d+)?', text)]
+    if not nums:
+        return DURATION_DEFAULT
+    unit = 60 if re.search(r'分|min|m\b', text) else 1
+    lo, hi = (nums[0], nums[1]) if len(nums) > 1 else (nums[0] * .9, nums[0] * 1.1)
+    return (lo * unit, hi * unit)
+
+
+def voice_rate(spec):
+    """characters per second of the film's voice (from the catalog; 5 when unknown)."""
+    v = voice_of(spec)
+    if not v:
+        return None
+    try:
+        sys.path.insert(0, str(SCRIPTS))
+        import audio_env
+        return float(audio_env.voice_profile(v).get('chars_per_second') or 5.0)
+    except SystemExit:
+        return 5.0
+
+
+def estimate_seconds(spec):
+    """film length before any voice exists: the animation of each step, or its line read at the voice's pace."""
+    sp, rate = speed_of(spec), voice_rate(spec)
+    anim, allsteps, t = 3.6 / sp, steps_of(spec), LEAD
+    for n, (ci, si, st) in enumerate(allsteps):
+        d = anim
+        if not rate and spec.get('read_pace', True):
+            d = max(anim, READ_BASE + len(SPOKEN.sub('', st.get('note') or '')) / READ_CPS)
+        if rate:
+            chars = len(SPOKEN.sub('', st.get('say') or st.get('note') or ''))
+            if chars:
+                d = max(anim, VOICE_AT + chars / rate + .05 + GAP)
+        if n + 1 == len(allsteps) or allsteps[n + 1][0] != ci:
+            d += CHAPTER_GAP
+        d += float(st.get('hold') or 0)
+        t += d
+    return t + 2.5 / sp + .8
+
+
+def load(job):
+    job = Path(job).resolve()
+    return job, json.loads((job / 'film.json').read_text())
+
+
+def voice_of(spec):
+    v = spec.get('voice', 'crayon-sister')
+    return None if v in (None, False, 'none', '') else v
+
+
+def speed_of(spec):
+    return float(spec.get('speed') or (2 if voice_of(spec) else 3))
+
+
+def edge_ids(ch):
+    seen, out = {}, []
+    for e in ch.get('edges') or []:
+        base = f"{e['from']}>{e['to']}"
+        seen[base] = seen.get(base, 0) + 1
+        out.append(e.get('id') or (base if seen[base] == 1 else f'{base}#{seen[base]}'))
+    return out
+
+
+def steps_of(spec):
+    """(ci, si, step) for every step, in order."""
+    out = []
+    for ci, ch in enumerate(spec['chapters']):
+        for si, st in enumerate(ch.get('steps') or []):
+            out.append((ci, si, st if isinstance(st, dict) else {'note': st}))
+    return out
+
+
+def line_id(ci, si):
+    return f'c{ci + 1}s{si + 1:02d}'
+
+
+def go_list(st):
+    go = st.get('go')
+    return [] if go is None else go if isinstance(go, list) else [go]
+
+
+# ------------------------------------------------------------------ check
+def check(job, spec, quiet=False):
+    errors, warnings = [], []
+    if not isinstance(spec.get('cover_intro', True), bool):
+        errors.append('cover_intro must be true or false')
+    chapters = spec.get('chapters') or []
+    if not chapters:
+        errors.append('film.json has no chapters')
+    if not spec.get('size') and aspect_ratio(spec.get('aspect', '3:4')) is None:
+        errors.append(f"aspect {spec.get('aspect')!r}: write it as W:H (for example 3:4, 9:16, 16:9, 4:5, 2.35:1), height/width between {RATIO_LIMITS[0]} and {RATIO_LIMITS[1]}")
+    for ci, ch in enumerate(chapters):
+        where = f'chapter {ci + 1} ({ch.get("title", "")})'
+        states = ch.get('states') or {}
+        if not isinstance(states, dict) or not states:
+            errors.append(f'{where}: states must be a non-empty object {{id: {{label, tag, pin}}}}')
+            continue
+        regs = ch.get('regions')
+        lanes = (regs or {}).get('lanes') or []
+        box = (regs or {}).get('id', 'together') if regs else None
+        for l in lanes:
+            for s in l.get('states', []):
+                if s not in states:
+                    errors.append(f'{where}: lane {l.get("id")} lists {s}, which is not in states')
+        known = set(states) | ({box} if box else set())
+        ids = edge_ids(ch)
+        for e in ch.get('edges') or []:
+            for k in ('from', 'to'):
+                v = e.get(k)
+                if v not in known and not (k == 'to' and re.fullmatch(r'end\d*', str(v))):
+                    errors.append(f'{where}: arrow {e.get("from")}>{e.get("to")}: unknown {k} {v!r}')
+        if ch.get('start') and ch['start'] not in known:
+            errors.append(f'{where}: start {ch["start"]!r} is not a state')
+        if ch.get('exit') and ch['exit'].get('from') not in states:
+            errors.append(f'{where}: exit.from {ch["exit"].get("from")!r} is not a state')
+        if ch.get('exit') and ci == len(chapters) - 1:
+            warnings.append(f'{where}: the last chapter has an exit arrow with nowhere to go')
+        steps = ch.get('steps') or []
+        if not steps:
+            errors.append(f'{where}: no steps')
+        refs_ok = set(ids) | {'start', 'entry'} | ({f"{ch['exit']['from']}>exit"} if ch.get('exit') else set())
+        used = set()
+        for si, st in enumerate(steps):
+            st = st if isinstance(st, dict) else {'note': st}
+            for r in go_list(st):
+                if not (r in refs_ok or any(i.startswith(r + '#') for i in ids)):
+                    errors.append(f'{where} step {si + 1}: go {r!r} matches no arrow (arrows: {", ".join(ids)})')
+                used.add(r)
+            note = st.get('note') or ''
+            cap = i18n.caption_max(spec.get('language'), note)       # D: 24 for Chinese, 42 for Latin scripts
+            if len(note) > cap:
+                warnings.append(f'{where} step {si + 1}: caption has {len(note)} characters (keep to {cap}): {note}')
+            if st.get('voice'):
+                try:
+                    sys.path.insert(0, str(SCRIPTS))
+                    import audio_env
+                    if st['voice'] not in audio_env.voice_ids():
+                        errors.append(f"{where} step {si + 1}: voice {st['voice']!r} unknown")
+                except SystemExit:
+                    pass
+            said = st.get('say') or note
+            if voice_of(spec) and DIGITS.search(said) and not any(k in said for k in (spec.get('say') or {})):
+                warnings.append(f'{where} step {si + 1}: digits in a narrated line; add a "say" reading (VoxCPM2 does not read digits): {note}')
+        never = [i for i in ids if not any(u == i or i.startswith(u + '#') for u in used)]
+        if never:
+            warnings.append(f'{where}: arrows never drawn by a step: {", ".join(never)}')
+        if not any(r in ('start', 'entry') for st in steps for r in go_list(st if isinstance(st, dict) else {})):
+            warnings.append(f'{where}: no step goes "start" (or "entry"), so the first card has no arrow in')
+        lerr, lwarn = modelcheck.lint_chapter(ch)                  # vars / when / do / rule.fix / steps' "fix"
+        errors += [f'{where}: {m}' for m in lerr]
+        warnings += [f'{where}: {m}' for m in lwarn]
+    import statechart_io
+    warnings += statechart_io.schema_problems(spec)                # references/film.schema.json, when jsonschema is installed
+    model = []
+    if not errors:
+        model = modelcheck.check_film(spec)
+        for m in model:
+            where = f"chapter {m['chapter']}"
+            if m.get('error'):
+                warnings.append(f"{where}: checker: {m['error']}")
+                continue
+            ch = chapters[m['chapter'] - 1]
+            if m.get('rule'):
+                r = m['rule']
+                p = r.get('possible') or {}
+                if r['holds'] and p and not p['holds']:
+                    warnings.append(f"{where}: rule never {r['never']} holds under the logic (when / do), so there is no red path to show; "
+                                    f"if every arrow could be taken it would break: {' > '.join(p['path'])}")
+                elif r['holds']:
+                    warnings.append(f"{where}: rule never {r['never']} holds: no path reaches it, so there is no red path to show")
+                elif not quiet:
+                    print(f"{where}: the checker found the red path: {' > '.join(r['path'])}")
+                fx = r.get('fixed')
+                if fx and not fx['holds']:
+                    errors.append(f"{where}: the fix does not hold: with {fx['edge']} {'guarded by ' + repr(fx['when']) if fx.get('when') else 'cut'}, "
+                                  f"{r['never']} is still reached: {' > '.join(fx['path'])}")
+                elif fx and not quiet:
+                    print(f"{where}: the fix holds: with {fx['edge']} {'guarded by ' + repr(fx['when']) if fx.get('when') else 'cut'}, nothing reaches {r['never']}")
+            if m.get('rules'):                                     # a rules list: report it like TLC does
+                names = {s: (v or {}).get('label') or s for s, v in ch['states'].items()}
+                ck, rep = m['checked'], ch.get('reported') if isinstance(ch.get('reported'), dict) else {}
+                if not quiet:
+                    print(f"{where}: checked {ck['states']} configurations and {ck['steps']} transitions"
+                          + (f" ({rep.get('by', 'TLC')}: {rep['states']} states, {rep.get('steps')} steps)" if rep.get('states') else ''))
+                for i, (item, r) in enumerate(zip(ch.get('rules') or [], m['rules'])):
+                    name = (item.get('id') or item.get('text') or f'rules[{i + 1}]') if isinstance(item, dict) else f'rules[{i + 1}]'
+                    if r.get('error'):
+                        errors.append(f'{where}: rule {name}: {r["error"]}')
+                        continue
+                    by = f" (as reported by {r.get('by') or 'TLC'})" if r.get('source') == 'report' else ''
+                    if not quiet and r['holds'] is not None:
+                        print(f"  {'✓' if r['holds'] else '✗'} {name} {'holds' if r['holds'] else 'breaks'}{by}"
+                              + ('' if r['holds'] or not r.get('path') else f" in {r['steps']} steps: {' > '.join(names.get(s, s) for s in r['path'])}"))
+                    said = item.get('reported') if isinstance(item, dict) else None
+                    if not by and isinstance(said, dict) and said.get('holds') is not None and said['holds'] != r['holds']:
+                        warnings.append(f"{where}: rule {name}: the report says it {'holds' if said['holds'] else 'breaks'}, this chart says it "
+                                        f"{'holds' if r['holds'] else 'breaks'} (the chart may not draw everything the model checks)")
+                    fx = r.get('fixed')
+                    if fx and not fx['holds']:
+                        errors.append(f"{where}: rule {name}: the fix does not hold: with {fx['edge']} "
+                                      f"{'guarded by ' + repr(fx['when']) if fx.get('when') else 'cut'} it still breaks: {' > '.join(fx['path'])}")
+                    elif fx and not quiet:
+                        print(f"    the fix holds: with {fx['edge']} {'guarded by ' + repr(fx['when']) if fx.get('when') else 'cut'}, {name} holds")
+            reach, possible = set(m.get('reach') or ()), set((m.get('possible') or m).get('reach') or ())
+            if m.get('logic') and ch.get('vars') and not quiet:
+                print(f"{where}: logic: {m['configurations']} configurations under when / do, {m['possible']['configurations']} with every arrow possible")
+            for s in ch.get('states', {}):
+                if s not in possible:
+                    warnings.append(f'{where}: state {s} cannot be reached from the start')
+                elif s not in reach:
+                    warnings.append(f'{where}: state {s} is possible, but under the logic (when / do) it is never reached')
+            for eid in m.get('dead') or []:
+                warnings.append(f'{where}: arrow {eid} never fires under the logic: its when is false whenever it could be taken')
+            for msg in m.get('eval_errors') or []:
+                errors.append(f'{where}: checker: {msg}')
+            if m.get('capped') or (m.get('possible') or {}).get('capped'):
+                warnings.append(f'{where}: the checker stopped at {modelcheck.LIMIT} configurations (do the vars keep growing?), so its answers are not complete')
+            multi = [s for s in m.get('stuck', []) if len(s) > 1]
+            if multi:
+                warnings.append(f"{where}: stuck combinations (no way out): {multi[:3]}")
+    if not (job / 'scenes.js').exists():
+        warnings.append('no scenes.js: the posters will have no pictures (see references/scenes.md)')
+    warnings += audio_plan.lint(spec)                                # D: sfx / ambience / tone / speaker fields
+    if chapters and not errors:
+        est, (lo, hi) = estimate_seconds(spec), target_duration(spec)
+        nsteps = max(1, len(steps_of(spec)))
+        per = est / nsteps
+        if est < lo * .95:
+            warnings.append(f'length: about {est:.0f} s, target {lo:.0f}-{hi:.0f} s. Add about {int((lo - est) / per) + 1} steps '
+                            f'(another chapter, or 2-3 more steps per chapter), or give lines more words; or set "duration"')
+        elif est > hi * 1.05:
+            warnings.append(f'length: about {est:.0f} s, target {lo:.0f}-{hi:.0f} s. Cut about {int((est - hi) / per) + 1} steps or shorten lines; or set "duration"')
+    v = voice_of(spec)
+    if v:
+        try:
+            sys.path.insert(0, str(SCRIPTS))
+            import audio_env
+            if v not in audio_env.voice_ids():
+                errors.append(f"voice {v!r} unknown; voices: {', '.join(audio_env.voice_ids())}")
+        except SystemExit as e:
+            warnings.append(f'voice catalog: {e}')
+    res = {'errors': errors, 'warnings': warnings, 'model': model}
+    if chapters and not errors:
+        lo, hi = target_duration(spec)
+        res['length'] = {'estimate_seconds': round(estimate_seconds(spec), 1), 'target_seconds': [round(lo), round(hi)], 'steps': len(steps_of(spec))}
+    if not quiet:
+        print(json.dumps({k: res[k] for k in ('errors', 'warnings', 'length') if k in res}, ensure_ascii=False, indent=1))
+    return res
+
+
+def resolved(spec):
+    """film.json as the page needs it: rule paths filled in by the checker."""
+    s = json.loads(json.dumps(spec))
+    modelcheck.apply_found_paths(s)
+    s['size'] = list(frame_size(spec))
+    return s
+
+
+# ------------------------------------------------------------------ pages
+def font_css():
+    def url(name):
+        return (FONTS / name).as_uri()
+    hand = f"url('{url('LXGWWenKai-500.woff')}') format('woff')"
+    # bundled CJK faces (GB2312 subsets, OFL); a character outside the subset falls back to the system's serif
+    song = f"url('{url('NotoSerifSC-Bold-gb.woff2')}') format('woff2'), local('Noto Serif CJK SC Bold'), local('STSongti-SC-Bold'), local('Songti SC Bold')"
+    fang = f"url('{url('ZhuqueFangsong-gb.woff2')}') format('woff2')"
+    marker = f"url('{url('LXGWMarkerGothic-gb.woff2')}') format('woff2')"
+    return f"""
+@font-face {{ font-family: 'Special Elite'; src: url('{url('SpecialElite-Regular.ttf')}'); }}
+@font-face {{ font-family: 'Courier Prime'; src: url('{url('CourierPrime-Regular.ttf')}'); font-style: normal; font-weight: 400; }}
+@font-face {{ font-family: 'Courier Prime'; src: url('{url('CourierPrime-Italic.ttf')}'); font-style: italic; font-weight: 400; }}
+@font-face {{ font-family: 'Courier Prime'; src: url('{url('CourierPrime-Bold.ttf')}'); font-style: normal; font-weight: 700; }}
+@font-face {{ font-family: 'SCV Hand'; src: {hand}; font-style: normal; }}
+@font-face {{ font-family: 'SCV Hand'; src: {hand}; font-style: italic; }}
+@font-face {{ font-family: 'SCV Type'; src: {song}; }}
+@font-face {{ font-family: 'SCV Fangsong'; src: {fang}; }}
+@font-face {{ font-family: 'SCV Marker'; src: {marker}; }}
+@font-face {{ font-family: 'Kevin Serif'; src: url('{url('KevinSerif-Regular.woff2')}') format('woff2'); font-weight: 400; }}
+@font-face {{ font-family: 'Kevin Serif'; src: url('{url('KevinSerif-Bold.woff2')}') format('woff2'); font-weight: 700; }}
+@font-face {{ font-family: 'Kevin Sans'; src: url('{url('KevinSans-Regular.woff2')}') format('woff2'); font-weight: 400; }}
+@font-face {{ font-family: 'Kevin Sans'; src: url('{url('KevinSans-Bold.woff2')}') format('woff2'); font-weight: 700; }}
+"""
+
+
+def write_page(job, spec, mode='play', timing=None, opts=None):
+    work = job / 'work'
+    work.mkdir(exist_ok=True)
+    (work / 'fonts.css').write_text(font_css())
+    film = resolved(spec)
+    data = (f"window.MODE = {json.dumps(mode)};\nwindow.FILM = {json.dumps(film, ensure_ascii=False)};\n"
+            f"window.TIMING = {json.dumps(timing)};\nwindow.PLAYER_OPTS = {json.dumps(opts or spec.get('player') or {})};\n"
+            "window.SCENES = window.SCENES || {};\n")
+    (work / f'data-{mode}.js').write_text(data)
+    scenes = (job / 'scenes.js').as_uri() if (job / 'scenes.js').exists() else None
+    W, H = frame_size(spec)
+    tags = '\n'.join(f'<script src="{(CRAYON / f).as_uri()}"></script>' for f in ENGINE_FILES[:-1])
+    html = f"""<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="fonts.css">
+<style>html,body{{margin:0;background:#e9e3d6}} canvas{{display:block}}</style></head><body>
+<canvas id="cv" width="{W}" height="{H}"></canvas>
+<script src="data-{mode}.js"></script>
+{tags}
+{f'<script src="{scenes}"></script>' if scenes else ''}
+<script src="{(CRAYON / 'main.js').as_uri()}"></script>
+<script src="{(CRAYON / 'record.js').as_uri()}"></script>
+</body></html>"""
+    page = work / f'page-{mode}.html'
+    page.write_text(html)
+    return page
+
+
+def need_render_python():
+    try:
+        import playwright  # noqa
+        return None
+    except ImportError:
+        return RENDER_PY
+
+
+def open_page(p, page_html, W=1080, H=1440, timeout=180000):
+    args = ['--allow-file-access-from-files', '--disable-web-security']
+    try:
+        b = p.chromium.launch(channel='chrome', args=args)          # the installed Google Chrome
+    except Exception:
+        b = p.chromium.launch(args=args)                            # or Playwright's own Chromium (setup.sh installs it)
+    pg = b.new_page(viewport={'width': W, 'height': H}, device_scale_factor=1)
+    errors = []
+    pg.on('pageerror', lambda e: errors.append(str(e)))
+    pg.on('console', lambda m: errors.append('console: ' + m.text) if m.type == 'error' else None)
+    pg.goto(page_html.as_uri())
+    pg.wait_for_function('window.ENGINE_READY === true || !!window.ENGINE_ERROR', timeout=timeout)
+    err = pg.evaluate('window.ENGINE_ERROR || null')
+    if err:
+        raise SystemExit('engine error:\n' + err + '\n' + '\n'.join(errors))
+    return b, pg, errors
+
+
+def b64(data):
+    return base64.b64decode(data.split(',', 1)[1])
+
+
+def contact(files, dest, tw=300, cols=6, labels=None):
+    from PIL import Image, ImageDraw
+    if not files:
+        return
+    ims = [Image.open(f) for f in files]
+    th = int(tw * ims[0].height / ims[0].width)
+    cols = min(cols, len(ims))
+    rows = math.ceil(len(ims) / cols)
+    sheet = Image.new('RGB', (cols * (tw + 8) + 8, rows * (th + 30) + 8), (40, 40, 40))
+    d = ImageDraw.Draw(sheet)
+    for i, (im, f) in enumerate(zip(ims, files)):
+        x, y = 8 + (i % cols) * (tw + 8), 8 + (i // cols) * (th + 30)
+        sheet.paste(im.convert('RGB').resize((tw, th)), (x, y))
+        d.text((x + 4, y + th + 6), (labels[i] if labels else Path(f).stem), fill=(230, 230, 230))
+    sheet.save(dest, quality=88)
+
+
+# ------------------------------------------------------------------ layout
+def layout(job, spec):
+    from playwright.sync_api import sync_playwright
+    page = write_page(job, spec, 'layout')
+    out = job / 'work/layout'
+    out.mkdir(parents=True, exist_ok=True)
+    W, H = frame_size(spec)
+    with sync_playwright() as p:
+        b, pg, errors = open_page(p, page, W, H)
+        rep = pg.evaluate('layoutReport()')
+        imgs = pg.evaluate('layoutImages(true)')
+        b.close()
+    files = []
+    for ci, data in enumerate(imgs):
+        f = out / f'ch{ci + 1}.png'
+        f.write_bytes(b64(data))
+        files.append(f)
+        (out / f'ch{ci + 1}.json').write_text(json.dumps(rep['chapters'][ci], ensure_ascii=False, indent=1))
+    rep['page_errors'] = errors
+    (out / 'report.json').write_text(json.dumps(rep, ensure_ascii=False, indent=1))
+    contact(files, out / 'contact.jpg', tw=420, cols=4)
+    for w in rep['warnings']:
+        print('warning:', w)
+    if errors:
+        print('page errors:', *errors[:6], sep='\n  ')
+    print(f'wrote {len(files)} layouts to {out} (chN.png with a 100-unit grid, chN.json with every card, arrow and free area)')
+    return rep
+
+
+# ------------------------------------------------------------------ narration
+def write_lines(job, spec):
+    v = voice_of(spec)
+    lines = []
+    for ci, si, st in steps_of(spec):
+        text = (st.get('note') or '').strip()
+        if not text and not st.get('say'):
+            continue
+        item = {'id': line_id(ci, si), 'text': text or st['say']}
+        if st.get('say'):
+            item['say'] = st['say']
+        if st.get('voice'):
+            item['voice'] = st['voice']
+        if st.get('tone'):
+            item['tone'] = st['tone']                    # VoxCPM2 control text, see references/voices.md
+        lines.append(item)
+    out = {'language': spec.get('language', 'zh'), 'voice': v, 'say': spec.get('say') or {}, 'lines': lines}
+    if spec.get('voxcpm'):
+        out['voxcpm'] = spec['voxcpm']
+    (job / 'work').mkdir(parents=True, exist_ok=True)
+    (job / 'work/lines.json').write_text(json.dumps(out, ensure_ascii=False, indent=1))
+    print('wrote', job / 'work/lines.json', len(lines), 'lines, voice', v)
+    return out
+
+
+def voice(job, spec, redo=None):
+    write_lines(job, spec)
+    args = [str(job)] + (['--redo', redo] if redo else [])
+    run_py('voice.py', *args, python=MLX_PY if Path(MLX_PY).exists() else None)
+
+
+# ------------------------------------------------------------------ plan
+def plan(job, spec):
+    sp = speed_of(spec)
+    anim = 3.6 / sp
+    v = voice_of(spec)
+    durs = {}
+    if v:
+        vj = job / 'work/audio/voice.json'
+        if not vj.exists():
+            raise SystemExit('narrated film without work/audio/voice.json: run `scv.py voice JOB` first (or set "voice": "none")')
+        rep = json.loads(vj.read_text())
+        if rep.get('failed'):
+            raise SystemExit(f"voice.json has failed lines: {', '.join(rep['failed'])}; fix them with `scv.py voice JOB --redo ID`")
+        durs = {k: x['dur'] for k, x in rep['lines'].items()}
+    t = LEAD
+    steps, lines = [], []
+    allsteps = steps_of(spec)
+    for n, (ci, si, st) in enumerate(allsteps):
+        lid = line_id(ci, si)
+        d = anim
+        if lid in durs:
+            d = max(anim, VOICE_AT + durs[lid] + GAP)
+            lines.append({'id': lid, 'at': round(t + VOICE_AT, 3)})
+        elif not v and spec.get('read_pace', True):        # silent: long enough to read the caption
+            d = max(anim, READ_BASE + len(SPOKEN.sub('', st.get('note') or '')) / READ_CPS)
+        last_of_chapter = n + 1 == len(allsteps) or allsteps[n + 1][0] != ci
+        if last_of_chapter:
+            d += CHAPTER_GAP
+        d += float(st.get('hold') or 0)
+        if n + 1 == len(allsteps):
+            d += 2.5 / sp + .8
+        steps.append({'id': lid, 'ci': ci, 'si': si, 't0': round(t, 3), 'dur': round(d, 3), 't1': round(t + d, 3),
+                      'note': st.get('note') or '', 'tag': f"{ROMAN[ci]}.{si + 1}", 'speaker': st.get('speaker')})
+        t += d
+    total = round(t + .4, 3)
+    lo, hi = target_duration(spec)
+    stretch = 0.
+    if total < lo and steps:
+        stretch = min(MAX_STRETCH, (lo - total) / len(steps))
+        shift = 0.
+        for s_ in steps:
+            s_['t0'] = round(s_['t0'] + shift, 3)
+            s_['dur'] = round(s_['dur'] + stretch, 3)
+            s_['t1'] = round(s_['t0'] + s_['dur'], 3)
+            shift += stretch
+        for line in lines:
+            k = next(i for i, s_ in enumerate(steps) if s_['id'] == line['id'])
+            line['at'] = round(steps[k]['t0'] + VOICE_AT, 3)
+        total = round(total + shift, 3)
+    total, sync = audio_plan.music_sync(spec, steps, lines, sp, total, VOICE_AT)   # D: music "sync": onto the beat grid
+    W, H = frame_size(spec)
+    timing = {'W': W, 'H': H, 'fps': int(spec.get('fps', FPS)), 'speed': sp, 'lead': LEAD, 'duration': total, 'total': total, 'voice': v, 'target': [lo, hi], 'steps': steps}
+    # D: karaoke characters and the talk envelope (film seconds), sfx and ambience events (scripts/audio_plan.py)
+    entries = rep['lines'] if v else {}
+    at_of = {line['id']: line['at'] for line in lines}
+    for s_ in steps:
+        s_['chars'] = audio_plan.step_chars(entries.get(s_['id']), s_['note'], at_of[s_['id']]) if s_['id'] in at_of else None
+    timing['talk'] = audio_plan.talk_envelope([(line['at'], entries[line['id']]) for line in lines], total, timing['fps']) if lines else None
+    sfx, ambience = audio_plan.sound_events(spec, steps, sp)
+    (job / 'work').mkdir(exist_ok=True)
+    music = spec.get('music') or None
+    if isinstance(music, str):
+        music = {'mood': music}
+    if sync:
+        music = {**music, 'sync': sync}
+    timeline = {'duration': total, 'lines': lines, 'music': music, 'sfx': sfx, 'ambience': ambience}
+    timing, timeline = stage(spec, timing, timeline, sync)          # the hook and the overview (shifts everything after the hook)
+    total = timing['total']
+    (job / 'work/timing.json').write_text(json.dumps(timing, ensure_ascii=False, indent=1))
+    (job / 'work/timeline.json').write_text(json.dumps(timeline, ensure_ascii=False, indent=1))
+    print(f'plan: {len(steps)} steps, {total:.1f} s at speed {sp:g}' + (f', {len(lines)} narrated lines' if lines else ', silent')
+          + (f', +{stretch:.2f} s hold per step toward the target' if stretch else '')
+          + (f', {len(sfx)} sfx' if sfx else '') + (f", ambience {', '.join(a['kind'] for a in ambience)}" if ambience else '')
+          + (f", music on the beat ({sync['bpm']:g} bpm, +{sync['holds_s']:.2f} s, worst "
+             f"{max(abs(x['planned_error_ms']) for x in sync['targets']):.0f} ms)" if sync else ''))
+    if total < lo - 1 or total > hi + 1:
+        print(f'note: {total:.0f} s is outside the target {lo:.0f}-{hi:.0f} s ("duration" in film.json); '
+              + ('add steps or a chapter' if total < lo else 'cut steps') + ' to land inside it')
+    return timing
+
+
+def page_timing(timing):
+    """what the page needs from timing.json: step times, and when present the narration's character times, the
+    speaker, the talk envelope, the hook and the outro"""
+    steps = []
+    for s in timing['steps']:
+        st = {'t0': s['t0'], 'dur': s['dur']}
+        for k in ('chars', 'speaker'):
+            if s.get(k) is not None:
+                st[k] = s[k]
+        steps.append(st)
+    out = {'lead': timing['lead'], 'total': timing['total'], 'steps': steps}
+    for k in ('talk', 'hook', 'outro'):
+        if timing.get(k):
+            out[k] = timing[k]
+    return out
+
+
+HOOK_SECONDS, OUTRO_SECONDS = 3.4, 5.5
+
+
+def stage(spec, timing, timeline, sync=None):
+    """the opening hook (the finished first poster and a question) and the closing overview: shift everything after
+    the hook, add the outro at the end. Applied by plan() just before it writes timing.json and timeline.json. With
+    music sync the hook lasts whole bars, so everything after it stays on the beat grid."""
+    hook = spec.get('hook')
+    outro = spec.get('outro', 'overview' if len(spec.get('chapters') or []) >= 2 else False)
+    if hook:
+        d = HOOK_SECONDS
+        if sync and sync.get('bpm'):
+            bar = 4 * 60. / float(sync['bpm'])
+            d = round(max(1, math.ceil(HOOK_SECONDS / bar - .25)) * bar, 3)
+        timing['hook'] = {'dur': d, 'text': hook if isinstance(hook, str) else (spec.get('title') or '')}
+        for s in timing['steps']:
+            s['t0'] = round(s['t0'] + d, 3)
+            s['t1'] = round(s['t1'] + d, 3)
+            if s.get('chars'):
+                s['chars'] = [[c[0], round(c[1] + d, 3), round(c[2] + d, 3)] for c in s['chars']]
+        for line in timeline.get('lines', []):
+            line['at'] = round(line['at'] + d, 3)
+        for e in timeline.get('sfx', []) or []:
+            e['at'] = round(e['at'] + d, 3)
+        for a in timeline.get('ambience', []) or []:
+            a['from'] = round(a['from'] + d, 3)
+            a['to'] = round(a['to'] + d, 3)
+        tk = timing.get('talk')
+        if tk and tk.get('env') is not None:
+            tk['env'] = [0] * round(d * tk.get('fps', 30)) + tk['env']
+        timing['total'] = timing['duration'] = round(timing['total'] + d, 3)
+    if outro:
+        at = round(timing['total'] - .4, 3)
+        timing['outro'] = {'at': at, 'dur': OUTRO_SECONDS}
+        timing['total'] = timing['duration'] = round(at + OUTRO_SECONDS, 3)
+    timeline['duration'] = timing['total']
+    return timing, timeline
+
+
+# ------------------------------------------------------------------ stills, posters
+def stills(job, spec, times=None, tw=300):
+    from playwright.sync_api import sync_playwright
+    timing = json.loads((job / 'work/timing.json').read_text())
+    page = write_page(job, spec, 'play', page_timing(timing))
+    labels = None
+    if not times:
+        times = [round(s['t0'] + min(s['dur'] - .05, max(.9, 1.4 / timing['speed'] + .35)), 2) for s in timing['steps']]
+        labels = [f"{s['tag']} {s['t0']:.1f}s" for s in timing['steps']]
+    out = job / 'work/stills'
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    files = []
+    with sync_playwright() as p:
+        b, pg, errors = open_page(p, page, timing['W'], timing['H'])
+        for t in times:
+            f = out / f't{t:07.2f}.jpg'
+            f.write_bytes(b64(pg.evaluate(f'frameJPEG({t}, .9)')))
+            files.append(f)
+        b.close()
+    if errors:
+        print('page errors:', *errors[:5], sep='\n  ')
+    contact(files, out / 'contact.jpg', tw, labels=labels)
+    print('wrote', len(files), 'stills and', out / 'contact.jpg')
+    return files
+
+
+def posters(job, spec):
+    from playwright.sync_api import sync_playwright
+    from PIL import Image
+    timing = json.loads((job / 'work/timing.json').read_text()) if (job / 'work/timing.json').exists() else None
+    page = write_page(job, spec, 'play', page_timing(timing) if timing else None)
+    out = job / 'outputs/posters'
+    out.mkdir(parents=True, exist_ok=True)
+    W, H = frame_size(spec)
+    files = []
+    with sync_playwright() as p:
+        b, pg, errors = open_page(p, page, W, H)
+        for ci in range(len(spec['chapters'])):
+            f = out / f'{ci + 1:02d}.png'
+            f.write_bytes(b64(pg.evaluate(f'posterPNG({ci})')))
+            (out / f'{ci + 1:02d}-layout.png').write_bytes(b64(pg.evaluate(f'posterPNG({ci}, {{overlay: true}})')))
+            files.append(f)
+        (job / 'outputs/cover.png').write_bytes(b64(pg.evaluate('coverPNG()')))
+        b.close()
+    print('wrote', len(files), 'posters to', out, 'and outputs/cover.png')
+    return files
+
+
+# ------------------------------------------------------------------ render
+def render_chunk(job, spec, f0, f1, dest, encoder='legacy'):
+    """one browser renders frames [f0, f1) into one H.264 file (x264 also writes the master's chunk, see frames.py);
+    any failure exits non-zero (the parent retries)"""
+    from playwright.sync_api import sync_playwright
+    import frames
+    timing = json.loads((job / 'work/timing.json').read_text())
+    W, H, fps = timing['W'], timing['H'], timing['fps']
+    if encoder == 'legacy':
+        cmd = ['ffmpeg', '-v', 'error', '-y', '-f', 'image2pipe', '-framerate', str(fps), '-c:v', 'mjpeg', '-i', '-',
+               '-c:v', 'libx264', '-preset', 'slow', '-crf', '26', '-pix_fmt', 'yuv420p', '-g', str(fps * 2), str(dest)]
+        ff = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    beat = Path(str(dest) + '.beat')
+    beat.write_text('launch')
+    with sync_playwright() as p:
+        b, pg, errors = open_page(p, job / 'work/page-play.html', W, H)
+        beat.write_text(f'ready {f0}')
+        pg.set_default_timeout(30000)
+        if encoder == 'legacy':
+            for f in range(f0, f1):
+                ff.stdin.write(b64(pg.evaluate(f'frameJPEG({f / fps:.6f}, .94)')))
+                if f % 15 == 0:
+                    beat.write_text(f'frame {f}')
+            ff.stdin.close()
+            rc = ff.wait()
+        elif encoder == 'webcodecs':
+            rc = frames.record_webcodecs(pg, W, H, fps, f0, f1, dest, beat)
+        else:
+            rc = frames.record_x264(pg, W, H, fps, f0, f1, dest, beat)
+        if errors:
+            print('page errors:', *errors[:3], sep='\n  ', file=sys.stderr)
+        beat.write_text('done' if rc == 0 else 'ffmpeg-failed')
+        import threading  # closing Chrome can hang: try politely, never wait long
+        th = threading.Thread(target=lambda: b.close(), daemon=True)
+        th.start()
+        th.join(8)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0 if rc == 0 else 3)
+
+
+def render(job, spec, workers=6, start=0.0, end=None, chunk_seconds=8.0, encoder=None):
+    """short chunks, each in its own process group with a heartbeat; a stuck or crashed browser is killed and its
+    chunk rendered again. encoder: x264 (default: film + master), webcodecs, legacy (see frames.py)"""
+    import signal
+    import frames
+    encoder = frames.encoder_of(spec, encoder)
+    timing = json.loads((job / 'work/timing.json').read_text())
+    write_page(job, spec, 'play', page_timing(timing))
+    if encoder == 'webcodecs':
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b, pg, _ = open_page(p, job / 'work/page-play.html', timing['W'], timing['H'])
+            ok = frames.probe_webcodecs(pg)
+            b.close()
+        if not ok.get('supported'):
+            print(f'webcodecs: this Chrome has no {frames.WEBCODECS["codec"]} encoder; using x264', flush=True)
+            encoder = 'x264'
+    fps = timing['fps']
+    dur = end or timing['duration']
+    F0, F1 = round(start * fps), round(dur * fps)
+    step = max(30, int(chunk_seconds * fps))
+    seg = job / 'work/render/seg'
+    if seg.exists():
+        shutil.rmtree(seg)
+    seg.mkdir(parents=True)
+    todo = [(i, f, min(F1, f + step), seg / f'chunk{i:04d}.mp4', 0) for i, f in enumerate(range(F0, F1, step))]
+    chunks = [t[3] for t in todo]
+    running, t0, failed = [], time.time(), []
+    while todo or running:
+        while todo and len(running) < workers:
+            i, a, b, dest, tries = todo.pop(0)
+            log = open(seg / f'chunk{i:04d}.log', 'w')
+            pr = subprocess.Popen([sys.executable, __file__, '_chunk', str(job), str(a), str(b), str(dest), encoder], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            running.append([pr, (i, a, b, dest, tries), time.time() + 120 + (b - a) * 1.2, log, time.time(), -1])
+        time.sleep(0.5)
+        for item in running[:]:
+            pr, task, deadline, log, _, _ = item
+            rc = pr.poll()
+            bf = Path(str(task[3]) + '.beat')
+            state = bf.read_text() if bf.exists() else 'launch'
+            if state != item[5]:
+                item[4], item[5] = time.time(), state
+            stalled = time.time() - item[4] > (150 if state == 'launch' else 60)
+            if rc is None and state == 'done':
+                rc = 0
+            if rc is None and time.time() < deadline and not stalled:
+                continue
+            try:
+                os.killpg(pr.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            if rc is None:
+                print(f'chunk {task[0]}: {"stalled at " + str(item[5]) if stalled else "over time"}, killing its browser', flush=True)
+                pr.wait()
+                rc = 'timeout'
+            log.close()
+            running.remove(item)
+            i, a, b, dest, tries = task
+            if rc == 0 and dest.exists():
+                print(f'chunk {i} frames {a}-{b} done ({time.time() - t0:.0f} s)', flush=True)
+            elif tries < 3:
+                print(f'chunk {i} failed ({rc}); retrying', flush=True)
+                todo.append((i, a, b, dest, tries + 1))
+            else:
+                failed.append(i)
+    if failed:
+        raise SystemExit(f'render failed: chunks {failed} (see work/render/seg/*.log)')
+    dest, master = job / 'work/render/video.mp4', job / 'work/render/master.mp4'
+    masters = [frames.master_path(c) for c in chunks] if encoder == 'x264' else []
+    masters = masters if masters and all(m.exists() for m in masters) else []
+    for parts, out in [(chunks, dest)] + ([(masters, master)] if masters else []):
+        lst = seg / f'list-{out.stem}.txt'
+        lst.write_text(''.join(f"file '{c}'\n" for c in parts))
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', str(lst), '-c', 'copy', str(out)], check=True)
+    if not masters and master.exists():
+        master.unlink()                              # a master from an older render would not match this video
+    secs = time.time() - t0
+    (job / 'work/render/info.json').write_text(json.dumps({'encoder': encoder, 'frames': F1 - F0, 'seconds': round(secs, 1),
+                                                           'rendered_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}))
+    print(f'wrote {dest}' + (' and master.mp4' if masters else '') + f' ({F1 - F0} frames in {secs:.0f} s, {encoder})')
+    return dest
+
+
+# ------------------------------------------------------------------ sound and delivery
+def run_py(script, *args, python=None):
+    cmd = [python or sys.executable, str(SCRIPTS / script), *map(str, args)]
+    print('$', ' '.join(cmd), flush=True)
+    r = subprocess.run(cmd)
+    if r.returncode:
+        raise SystemExit(f'{script} failed ({r.returncode})')
+
+
+def sound(job, spec):
+    """voice and/or music and/or sfx through mix.py; nothing for a silent film"""
+    tl = json.loads((job / 'work/timeline.json').read_text())
+    if not (tl['lines'] or tl.get('music') or tl.get('sfx') or tl.get('ambience')):
+        return None
+    py = RENDER_PY if Path(RENDER_PY).exists() else None
+    a = job / 'work/audio'
+    if not tl['lines'] and not (a / 'voice.json').exists():  # mix.py reads voice.json even for a music-only film
+        a.mkdir(parents=True, exist_ok=True)
+        (a / 'voice.json').write_text(json.dumps({'voice': None, 'lines': {}, 'failed': {}}))
+    run_py('mix.py', job, python=py)
+    return job / 'work/audio/mix.wav'
+
+
+def srt_time(t):
+    ms = int(round(t * 1000))
+    return f'{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}'
+
+
+def finalize(job, spec):
+    work, outd = job / 'work', job / 'outputs'
+    outd.mkdir(exist_ok=True)
+    if not isinstance(spec.get('cover_intro', True), bool):
+        raise SystemExit('cover_intro must be true or false')
+    cover = outd / 'cover.png'
+    intro_seconds = COVER_HOLD_SECONDS + COVER_FADE_SECONDS if spec.get('cover_intro', True) else 0.
+    if intro_seconds and not cover.is_file():
+        raise SystemExit('cover intro needs outputs/cover.png: run `scv.py posters JOB` first (or set "cover_intro": false)')
+    mix = sound(job, spec)
+    video = work / 'render/video.mp4'
+    timing = json.loads((work / 'timing.json').read_text())
+    dest = outd / 'film.mp4'
+    if mix and mix.exists():
+        audio = ['-i', str(mix)]
+    else:  # a silent track, so every platform accepts the file
+        audio = ['-f', 'lavfi', '-t', str(timing['duration']), '-i', 'anullsrc=r=48000:cl=stereo']
+    comment = 'comment=AI-generated narration (VoxCPM2 designed voice)' if voice_of(spec) else 'comment=sweety-statechart-video'
+    import aigc                                      # GB 45438 implicit label: AIGC in moov.udta.meta (see aigc.py)
+    import frames as frames_mod
+    label = aigc.identity(job, spec)
+    aigc.save(job, label)
+    meta = ['-metadata', comment, *aigc.ffmpeg_args(label), '-movflags', '+faststart+use_metadata_tags']
+    duration = round(timing['duration'] + intro_seconds, 3)
+    master, master_out = work / 'render/master.mp4', outd / 'film-master.mp4'
+
+    def encode(src, out, abr, vargs):
+        """the platform file or the upload master: the cover intro (when on) re-encodes with that file's own x264
+        settings; without it the render's video is copied. Always built from the unprefixed render, so repeated
+        finalize calls never stack intros or subtitle offsets."""
+        inputs = ['-i', str(src), *audio]
+        encoding = ['-map', '0:v', '-map', '1:a', '-c:v', 'copy']
+        if intro_seconds:
+            width, height, fps = timing['W'], timing['H'], timing['fps']
+            inputs += ['-loop', '1', '-framerate', str(fps), '-i', str(cover)]
+            filters = (
+                f'[2:v]scale={width}:{height}:force_original_aspect_ratio=decrease,'
+                f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},'
+                f'trim=duration={intro_seconds},setpts=PTS-STARTPTS,format=yuv420p,'
+                f'fade=t=out:st={COVER_HOLD_SECONDS}:d={COVER_FADE_SECONDS}[cover];'
+                f'[0:v]setpts=PTS-STARTPTS,setsar=1,fps={fps},format=yuv420p[body];'
+                '[cover][body]concat=n=2:v=1:a=0[video];'
+                f'[1:a]asetpts=PTS-STARTPTS,adelay={round(intro_seconds * 1000)}:all=1,'
+                f'apad,atrim=duration={duration}[audio]'
+            )
+            encoding = ['-filter_complex', filters, '-map', '[video]', '-map', '[audio]', *vargs, '-r', str(fps)]
+        pending = out.with_name('.' + out.stem + '-finalizing.mp4')
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', *inputs, *encoding, '-c:a', 'aac', '-b:a', abr,
+                        '-t', str(duration), '-shortest', *meta, str(pending)], check=True)
+        pending.replace(out)
+
+    encode(video, dest, '192k', frames_mod.FILM)
+    if master.exists():
+        encode(master, master_out, '320k', frames_mod.MASTER)
+    elif master_out.exists():
+        master_out.unlink()                          # from an older render
+    (outd / 'editing').mkdir(exist_ok=True)
+    if mix and mix.exists():                         # the narration-bearing mix, for editors, labelled too
+        shutil.copy(mix, outd / 'editing/audio.wav')
+        aigc.tag_wav(outd / 'editing/audio.wav', label)
+    for f in sorted((outd / 'posters').glob('*.png')) + [outd / 'cover.png']:
+        if f.exists():
+            aigc.tag_png(f, label)
+    delivery_steps = [{**s, 't0': round(s['t0'] + intro_seconds, 3), 't1': round(s['t1'] + intro_seconds, 3)} for s in timing['steps']]
+    for step in delivery_steps:
+        if step.get('chars'):
+            step['chars'] = [[c, round(a + intro_seconds, 3), round(b + intro_seconds, 3)] for c, a, b in step['chars']]
+    rows = [f"{i + 1}\n{srt_time(s['t0'])} --> {srt_time(s['t1'])}\n{s['note']}\n" for i, s in enumerate(delivery_steps) if s['note']]
+    (outd / 'editing/captions.srt').write_text('\n'.join(rows))
+    (outd / 'editing/delivery-timing.json').write_text(json.dumps({
+        'duration': duration, 'body_offset_seconds': intro_seconds,
+        'cover_intro': {'hold_seconds': COVER_HOLD_SECONDS, 'fade_seconds': COVER_FADE_SECONDS} if intro_seconds else None,
+        'steps': delivery_steps,
+    }, ensure_ascii=False, indent=1))
+    (outd / 'script.txt').write_text('\n'.join(f"{s['tag']}  {s['note']}" for s in timing['steps']))
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration,size', '-of', 'json', str(dest)], capture_output=True, text=True)
+    print('delivered', dest, json.dumps(json.loads(probe.stdout or '{}').get('format', {})))
+    if master_out.exists():
+        print('upload master', master_out, f'{master_out.stat().st_size / 1e6:.1f} MB')
+    print('AIGC', aigc.value(aigc.read(dest) or {}))
+    return dest
+
+
+def all_steps(job, spec, workers=6):
+    res = check(job, spec, quiet=True)
+    if res['errors']:
+        print(json.dumps(res['errors'], ensure_ascii=False, indent=1))
+        raise SystemExit('fix the errors in film.json first')
+    if voice_of(spec):
+        voice(job, spec)
+    plan(job, spec)
+    render(job, spec, workers=workers)
+    posters(job, spec)
+    dest = finalize(job, spec)
+    import deliver, publish                                    # extra outputs: film.json "deliver"; the publish pack
+    if spec.get('deliver'):
+        deliver.deliver(job, spec, spec['deliver'])
+    publish.publish(job, spec)
+    return dest
+
+
+# ------------------------------------------------------------------ new job
+SKELETON = {
+    "title": "片名", "series": "系列名（每张海报的页眉）", "language": "zh", "aspect": "3:4", "voice": "crayon-sister",
+    "chapters": [{
+        "title": "第一章", "sub": "一句副标题", "tagline": "english words · 或者一行小字",
+        "states": {"a": {"label": "状态甲", "tag": "state a", "pin": "pink"}, "b": {"label": "状态乙", "tag": "state b", "pin": "straw"}},
+        "start": "a",
+        "edges": [{"from": "a", "to": "b", "label": "发生了什么", "if": "条件"}],
+        "steps": [{"go": "start", "note": "一句字幕，也是旁白"}, {"go": "a>b", "note": "下一句"}]
+    }]
+}
+SCENES_SKELETON = """// scenes.js — the living pictures around each chapter's chart (see references/scenes.md).
+// SCENES[n] = { bg($) {...static...}, fg($, S) {...every frame...} };  n = chapter number (1-based)
+// $ = crayon kit bound to the poster (units: 1000 wide), S = {T, t, step, on(id), since(id), at(k), done}
+SCENES[1] = {
+  bg($) {
+    $.ground(40, 420, 1180, 10, 'g1');
+  },
+  fg($, S) {
+    $.sun(860, 120, 36, S.T);
+  },
+};
+"""
+
+
+def new_job(job, title=None):
+    job = Path(job).resolve()
+    job.mkdir(parents=True, exist_ok=True)
+    sk = json.loads(json.dumps(SKELETON))
+    if title:
+        sk['title'] = title
+    if not (job / 'film.json').exists():
+        (job / 'film.json').write_text(json.dumps(sk, ensure_ascii=False, indent=1))
+    if not (job / 'scenes.js').exists():
+        (job / 'scenes.js').write_text(SCENES_SKELETON)
+    print('new job', job)
+
+
+def list_voices():
+    sys.path.insert(0, str(SCRIPTS))
+    import audio_env
+    for path, cat in audio_env.catalogs():
+        print(f'# {path}')
+        for v in cat.get('voices', []):
+            print(f"  {v['id']:28s} {v.get('name', ''):10s} {v.get('description', '')[:60]}")
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ('gallery', 'draft'):    # own options: scripts/gallery.py, scripts/scene_draft.py
+        sys.path.insert(0, str(SCRIPTS))
+        sys.exit(__import__('gallery' if sys.argv[1] == 'gallery' else 'scene_draft').main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == 'add-voice':         # its own options; handled by add_voice.py
+        run_py('add_voice.py', *sys.argv[2:], python=MLX_PY if Path(MLX_PY).exists() else None)
+        return
+    if len(sys.argv) > 1 and sys.argv[1] in ('import', 'export'):  # code <-> film.json; options in statechart_io.py
+        import statechart_io
+        return statechart_io.cli(sys.argv[1:], new_job=new_job)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('cmd')
+    ap.add_argument('jobs', nargs='*')
+    ap.add_argument('--at')
+    ap.add_argument('--width', type=int, default=300)
+    ap.add_argument('--workers', type=int, default=6)
+    ap.add_argument('--start', type=float, default=0.0)
+    ap.add_argument('--end', type=float)
+    ap.add_argument('--title')
+    ap.add_argument('--redo')
+    ap.add_argument('--lang', help='work on the translated version from film.json i18n (JOB/lang/<code>/)')
+    ap.add_argument('--encoder', help='render: x264 (default), webcodecs or legacy')
+    ap.add_argument('--what', help='deliver: clips,longimage,html,gif,site,social (default: film.json "deliver", else all)')
+    ap.add_argument('--port', type=int, default=8765, help='preview: port on 127.0.0.1')
+    ap.add_argument('--open', action='store_true', help='preview: open it in the default browser')
+    ap.add_argument('--update', action='store_true', help='golden: store the current frames as the new baseline')
+    a = ap.parse_args()
+    if a.cmd == 'voices':
+        return list_voices()
+    if a.cmd == 'new':
+        return new_job(a.jobs[0], a.title)
+    browser = ('layout', 'stills', 'render', 'posters', 'all', 'batch', '_chunk', 'lint', 'deliver', 'golden')
+    if a.cmd in browser and need_render_python() and Path(RENDER_PY).exists() and sys.executable != RENDER_PY:
+        os.execv(RENDER_PY, [RENDER_PY, __file__, *sys.argv[1:]])
+    if a.cmd == '_chunk':
+        job, spec = load(a.jobs[0])
+        return render_chunk(job, spec, int(a.jobs[1]), int(a.jobs[2]), Path(a.jobs[3]), *a.jobs[4:5])
+    if a.cmd == 'golden':                                      # the three examples; no JOB
+        import golden
+        sys.exit(golden.run(update=a.update, examples=a.jobs or None))
+    if a.cmd == 'batch':
+        summary = []
+        for j in a.jobs:
+            t0 = time.time()
+            try:
+                job, spec = load(j)
+                if a.lang:
+                    job, spec = load(i18n.sibling(job, spec, a.lang)[0])
+                dest = all_steps(job, spec, workers=a.workers)
+                summary.append({'job': str(job), 'ok': True, 'film': str(dest), 'seconds': round(time.time() - t0)})
+            except SystemExit as e:
+                summary.append({'job': j, 'ok': False, 'error': str(e)})
+        print(json.dumps(summary, ensure_ascii=False, indent=1))
+        return
+    job, spec = load(a.jobs[0])
+    if a.lang:                                                     # the translated sibling job, then the same pipeline
+        job, spec = load(i18n.sibling(job, spec, a.lang)[0])
+    if a.cmd == 'check':
+        sys.exit(1 if check(job, spec)['errors'] else 0)
+    elif a.cmd == 'layout':
+        layout(job, spec)
+    elif a.cmd == 'lint':
+        import lint as lint_mod
+        sys.exit(1 if lint_mod.lint(job, spec)['issues'] else 0)
+    elif a.cmd == 'lines':
+        write_lines(job, spec)
+    elif a.cmd == 'voice':
+        voice(job, spec, a.redo)
+    elif a.cmd == 'plan':
+        plan(job, spec)
+    elif a.cmd == 'stills':
+        stills(job, spec, times=[float(x) for x in a.at.split(',')] if a.at else None, tw=a.width)
+    elif a.cmd == 'render':
+        render(job, spec, workers=a.workers, start=a.start, end=a.end, encoder=a.encoder)
+    elif a.cmd == 'posters':
+        posters(job, spec)
+    elif a.cmd == 'finalize':
+        finalize(job, spec)
+    elif a.cmd == 'deliver':
+        import deliver
+        deliver.deliver(job, spec, a.what)
+    elif a.cmd == 'publish':
+        import publish
+        publish.publish(job, spec)
+    elif a.cmd == 'preview':
+        import preview
+        preview.serve(job, a.port, a.open)
+    elif a.cmd == 'all':
+        all_steps(job, spec, workers=a.workers)
+    else:
+        ap.error(f'unknown command {a.cmd}')
+
+
+if __name__ == '__main__':
+    main()
